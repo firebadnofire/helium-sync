@@ -1,0 +1,49 @@
+[package]
+name = "helium-sync-client-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+base64.workspace = true
+bytes.workspace = true
+chacha20poly1305.workspace = true
+directories.workspace = true
+helium-sync-common = { path = "../helium-sync-common" }
+helium-sync-profile = { path = "../helium-sync-profile" }
+hkdf.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+keyring.workspace = true
+rand.workspace = true
+reqwest.workspace = true
+rustls-pemfile.workspace = true
+russh.workspace = true
+secrecy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+url.workspace = true
+uuid.workspace = true
+x509-parser.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+axum-server.workspace = true
+helium-sync-server = { path = "../helium-sync-server" }
+rcgen.workspace = true
+rustls.workspace = true
+tempfile.workspace = true
+tower.workspace = true
+
+[lints]
+workspace = true

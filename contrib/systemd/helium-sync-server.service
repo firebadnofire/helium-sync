@@ -1,0 +1,40 @@
+[Unit]
+Description=Helium Sync encrypted object server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=helium-sync
+Group=helium-sync
+ExecStartPre=/usr/local/bin/helium-sync-server check --config /etc/helium-sync/server.toml --token-file /etc/helium-sync/token
+ExecStart=/usr/local/bin/helium-sync-server serve --config /etc/helium-sync/server.toml --token-file /etc/helium-sync/token
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=15s
+StateDirectory=helium-sync
+StateDirectoryMode=0750
+RuntimeDirectory=helium-sync
+RuntimeDirectoryMode=0750
+UMask=0027
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+ReadOnlyPaths=/etc/helium-sync
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,23 @@
+[package]
+name = "helium-sync-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+directories.workspace = true
+helium-sync-common = { path = "../../helium-sync-common" }
+helium-sync-client-core = { path = "../../helium-sync-client-core" }
+helium-sync-profile = { path = "../../helium-sync-profile" }
+secrecy.workspace = true
+serde.workspace = true
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tokio.workspace = true
+url.workspace = true
+
+[lints]
+workspace = true

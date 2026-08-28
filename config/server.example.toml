@@ -1,0 +1,20 @@
+# Copy this file, replace the paths, and provide the token through
+# HELIUM_SYNC_TOKEN or --token-file. A literal token here is supported for
+# managed secret-mounted configuration, but should not be committed.
+
+[server]
+listen = "0.0.0.0:7500"
+unix_socket = "/run/helium-sync/server.sock"
+unix_socket_mode = "0660"
+unix_socket_group = "helium-sync"
+data_dir = "/var/lib/helium-sync"
+
+[tls]
+certificate = "/etc/helium-sync/tls/server.crt"
+private_key = "/etc/helium-sync/tls/server.key"
+
+[storage]
+database = "/var/lib/helium-sync/server.sqlite3"
+
+[logging]
+level = "info"

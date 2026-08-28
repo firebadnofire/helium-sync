@@ -1,0 +1,23 @@
+[package]
+name = "helium-sync-profile"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+test-restore = []
+
+[dependencies]
+directories.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.55"
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

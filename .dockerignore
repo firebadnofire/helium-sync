@@ -1,0 +1,7 @@
+.git
+target
+**/node_modules
+**/dist
+*.sqlite3*
+.env
+docker/state

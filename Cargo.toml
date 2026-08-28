@@ -1,0 +1,64 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/helium-sync-common",
+    "crates/helium-sync-profile",
+    "crates/helium-sync-client-core",
+    "crates/helium-sync-client/src-tauri",
+    "crates/helium-sync-server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["Helium Sync contributors"]
+repository = "https://pubcode.archuser.org/firebadnofire/Helium-sync"
+
+[workspace.dependencies]
+async-trait = "0.1"
+axum = { version = "0.8", features = ["http1", "json", "tokio"] }
+axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
+base64 = "0.22"
+bytes = "1"
+chacha20poly1305 = { version = "0.10", features = ["std"] }
+clap = { version = "4", features = ["derive", "env"] }
+directories = "6"
+hkdf = "0.12"
+http = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1", "server"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "server", "service", "tokio"] }
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
+nix = { version = "0.30", features = ["fs", "user"] }
+rand = "0.10"
+rcgen = "0.14"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
+russh = { version = "0.62", default-features = false, features = ["ring", "rsa"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2"
+secrecy = { version = "0.10", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
+subtle = "2"
+tempfile = "3"
+thiserror = "2"
+time = { version = "0.3", features = ["serde", "formatting", "parsing", "macros"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+toml = "0.9"
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["limit", "request-id", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+url = { version = "2", features = ["serde"] }
+uuid = { version = "1", features = ["serde", "v4"] }
+x509-parser = "0.18"
+zeroize = { version = "1", features = ["derive"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"

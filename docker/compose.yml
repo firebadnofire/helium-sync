@@ -1,0 +1,30 @@
+services:
+  helium-sync-server:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: helium-sync-server:local
+    restart: unless-stopped
+    environment:
+      # Required: set a random value of at least 32 characters in the shell or .env.
+      HELIUM_SYNC_TOKEN: ${HELIUM_SYNC_TOKEN:?set HELIUM_SYNC_TOKEN to a strong random value}
+      # Explicitly opts into the image's localhost-only development certificate.
+      # Replace both paths with read-only mounted production certificate material.
+      HELIUM_SYNC_TLS_CERTIFICATE: /opt/helium-sync/dev-tls/server.crt
+      HELIUM_SYNC_TLS_PRIVATE_KEY: /opt/helium-sync/dev-tls/server.key
+    ports:
+      - "${HELIUM_SYNC_PORT:-7500}:7500"
+    volumes:
+      - helium-sync-data:/var/lib/helium-sync
+      - helium-sync-runtime:/run/helium-sync
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  helium-sync-data:
+  helium-sync-runtime:
