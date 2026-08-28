@@ -16,4 +16,10 @@ cargo check -p helium-sync-client
 
 Integration tests use temporary directories, in-memory secrets, a real rustls HTTPS socket, a controlled pure-Rust SSH server, and recording proxies below encryption. They assert that sentinel plaintext and bearer tokens are absent from captured outer bytes. Linux Unix-socket behavior, Docker, external OpenSSH, and packet capture remain host-dependent checks and must be reported as skipped when their prerequisites are absent.
 
+The ignored `remote_smoke` test exercises an explicitly configured live server over both HTTPS and real OpenSSH without embedding secrets or host-specific paths. Set `HELIUM_SYNC_TEST_URL`, `HELIUM_SYNC_TEST_TOKEN_FILE`, `HELIUM_SYNC_TEST_CA`, `HELIUM_SYNC_TEST_SSH_HOST`, `HELIUM_SYNC_TEST_SSH_USER`, `HELIUM_SYNC_TEST_SSH_KEY`, and `HELIUM_SYNC_TEST_SSH_SOCKET`, then run:
+
+```sh
+cargo test -p helium-sync-client-core --test remote_smoke -- --ignored
+```
+
 Do not test restoration against a live profile. The only restore writer is test-only and rejects known live Helium user-data paths.

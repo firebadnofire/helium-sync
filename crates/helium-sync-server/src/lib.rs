@@ -44,7 +44,10 @@ pub fn router(state: api::AppState) -> Router {
 }
 
 #[cfg(target_os = "linux")]
-async fn hsts(request: axum::extract::Request, next: middleware::Next) -> axum::response::Response {
+async fn hsts(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
     let mut response = next.run(request).await;
     response.headers_mut().insert(
         axum::http::header::STRICT_TRANSPORT_SECURITY,
