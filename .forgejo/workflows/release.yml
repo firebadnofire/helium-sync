@@ -53,9 +53,21 @@ jobs:
       version: ${{ steps.version.outputs.version }}
     steps:
       - name: Check out tagged source
-        uses: https://code.forgejo.org/actions/checkout@v4
-        with:
-          fetch-depth: 1
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          server_url="${FORGEJO_SERVER_URL:-${GITHUB_SERVER_URL:-}}"
+          repository="${FORGEJO_REPOSITORY:-${GITHUB_REPOSITORY:-}}"
+          sha="${FORGEJO_SHA:-${GITHUB_SHA:-}}"
+          if [[ -z "$server_url" || -z "$repository" || -z "$sha" ]]; then
+            echo "Forgejo server URL, repository, and commit SHA are required." >&2
+            exit 1
+          fi
+          git init .
+          git remote remove origin 2>/dev/null || true
+          git remote add origin "${server_url%/}/${repository}.git"
+          git fetch --no-tags --depth=1 origin "$sha"
+          git checkout --detach FETCH_HEAD
 
       - name: Match the tag to workspace and client versions
         id: version
@@ -111,7 +123,21 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - name: Check out tagged source
-        uses: https://code.forgejo.org/actions/checkout@v4
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          server_url="${FORGEJO_SERVER_URL:-${GITHUB_SERVER_URL:-}}"
+          repository="${FORGEJO_REPOSITORY:-${GITHUB_REPOSITORY:-}}"
+          sha="${FORGEJO_SHA:-${GITHUB_SHA:-}}"
+          if [[ -z "$server_url" || -z "$repository" || -z "$sha" ]]; then
+            echo "Forgejo server URL, repository, and commit SHA are required." >&2
+            exit 1
+          fi
+          git init .
+          git remote remove origin 2>/dev/null || true
+          git remote add origin "${server_url%/}/${repository}.git"
+          git fetch --no-tags --depth=1 origin "$sha"
+          git checkout --detach FETCH_HEAD
 
       - name: Install Linux build dependencies
         shell: bash
@@ -195,7 +221,21 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - name: Check out tagged source
-        uses: https://code.forgejo.org/actions/checkout@v4
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          server_url="${FORGEJO_SERVER_URL:-${GITHUB_SERVER_URL:-}}"
+          repository="${FORGEJO_REPOSITORY:-${GITHUB_REPOSITORY:-}}"
+          sha="${FORGEJO_SHA:-${GITHUB_SHA:-}}"
+          if [[ -z "$server_url" || -z "$repository" || -z "$sha" ]]; then
+            echo "Forgejo server URL, repository, and commit SHA are required." >&2
+            exit 1
+          fi
+          git init .
+          git remote remove origin 2>/dev/null || true
+          git remote add origin "${server_url%/}/${repository}.git"
+          git fetch --no-tags --depth=1 origin "$sha"
+          git checkout --detach FETCH_HEAD
 
       - name: Install Windows packaging prerequisites
         shell: bash
@@ -263,7 +303,21 @@ jobs:
     runs-on: macos-latest
     steps:
       - name: Check out tagged source
-        uses: https://code.forgejo.org/actions/checkout@v4
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          server_url="${FORGEJO_SERVER_URL:-${GITHUB_SERVER_URL:-}}"
+          repository="${FORGEJO_REPOSITORY:-${GITHUB_REPOSITORY:-}}"
+          sha="${FORGEJO_SHA:-${GITHUB_SHA:-}}"
+          if [[ -z "$server_url" || -z "$repository" || -z "$sha" ]]; then
+            echo "Forgejo server URL, repository, and commit SHA are required." >&2
+            exit 1
+          fi
+          git init .
+          git remote remove origin 2>/dev/null || true
+          git remote add origin "${server_url%/}/${repository}.git"
+          git fetch --no-tags --depth=1 origin "$sha"
+          git checkout --detach FETCH_HEAD
 
       - name: Install pinned Rust and Node toolchains
         shell: bash
@@ -326,6 +380,24 @@ jobs:
       - build-macos
     runs-on: ubuntu-22.04
     steps:
+      - name: Install pinned Node runtime
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates curl tar xz-utils
+
+          node_archive="node-v${NODE_VERSION}-linux-x64.tar.xz"
+          node_url="https://nodejs.org/dist/v${NODE_VERSION}"
+          tool_root="${RUNNER_TEMP:?}/node-v${NODE_VERSION}"
+          mkdir -p "$tool_root"
+          curl --proto '=https' --tlsv1.2 -fsSLo "$RUNNER_TEMP/$node_archive" "$node_url/$node_archive"
+          curl --proto '=https' --tlsv1.2 -fsSLo "$RUNNER_TEMP/SHASUMS256.txt" "$node_url/SHASUMS256.txt"
+          (cd "$RUNNER_TEMP"; grep "  ${node_archive}$" SHASUMS256.txt | sha256sum --check --strict -)
+          tar -xJf "$RUNNER_TEMP/$node_archive" --strip-components=1 -C "$tool_root"
+          printf '%s\n' "$tool_root/bin" >> "$GITHUB_PATH"
+
       - name: Download Linux release candidates
         uses: https://code.forgejo.org/forgejo/download-artifact@v4
         with:
