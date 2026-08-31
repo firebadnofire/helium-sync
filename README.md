@@ -1,8 +1,10 @@
 # Helium Sync
 
-Helium Sync is an initial encrypted bookmark export proof for the Helium browser. The desktop client discovers local Helium profiles, canonicalizes the selected profile's `Bookmarks` JSON, encrypts it locally, and verifies upload/retrieval against a self-hosted Linux server. The server stores only opaque ciphertext.
+Helium Sync provides encrypted multi-device bookmark synchronization for the Helium browser. The desktop client discovers local Helium profiles, reconciles local and server changes, encrypts them locally, and stores only opaque ciphertext on a self-hosted Linux server.
 
-This release is deliberately not continuous synchronization and never writes retrieved data into a live Helium profile.
+While the desktop client is open and signed in, enabled profiles are checked every 30 seconds. Independent bookmark additions, edits, and deletions are reconciled against an encrypted local merge base. Any local replacement is backed up with Zstandard compression first. Helium must be closed before server changes can be applied locally; the client detects the installed Helium executable and refuses to race it.
+
+This is bookmark continuity, not full Chrome/Firefox parity. Open tabs, browsing history, passwords, extensions, preferences, and live in-browser synchronization are not yet synchronized.
 
 > **New operator?** Start with the complete [download, build, deployment, client, backup, upgrade, and troubleshooting guide](op-guide.md).
 
@@ -12,6 +14,7 @@ This release is deliberately not continuous synchronization and never writes ret
 - Authenticated TLS 1.3 HTTPS and SSH-to-Unix-socket transports with the same versioned API.
 - XChaCha20-Poly1305 object encryption using client-held key material.
 - SQLite state, atomic batches, conflict detection, change cursors, and tombstones.
+- Cross-device encrypted profile discovery and three-way bookmark reconciliation.
 - Docker Compose and hardened systemd deployment examples.
 
 ## Start here

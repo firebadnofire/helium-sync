@@ -146,6 +146,72 @@ pub fn decrypt(master_key: &MasterKey, object: &SyncObject) -> Result<Vec<u8>, C
     Ok(plaintext)
 }
 
+pub fn encrypt_local_state(
+    master_key: &MasterKey,
+    purpose: &str,
+    plaintext: &[u8],
+) -> Result<Vec<u8>, ClientError> {
+    let mut key = derive_local_state_key(master_key, purpose)?;
+    let cipher = XChaCha20Poly1305::new((&key).into());
+    let mut nonce = [0_u8; 24];
+    rand::rng().fill_bytes(&mut nonce);
+    let aad = local_state_aad(purpose)?;
+    let ciphertext = cipher
+        .encrypt(
+            XNonce::from_slice(&nonce),
+            Payload {
+                msg: plaintext,
+                aad: &aad,
+            },
+        )
+        .map_err(|_| ClientError::Crypto("local state encryption failed".to_owned()))?;
+    key.zeroize();
+    serde_json::to_vec(&EncryptedEnvelopeV1 {
+        version: 1,
+        algorithm: "XCHACHA20-POLY1305-LOCAL-STATE".to_owned(),
+        key_version: 1,
+        nonce: Base64UrlBytes(nonce.to_vec()),
+        ciphertext: Base64UrlBytes(ciphertext),
+    })
+    .map_err(|error| ClientError::Serialization(error.to_string()))
+}
+
+pub fn decrypt_local_state(
+    master_key: &MasterKey,
+    purpose: &str,
+    encoded: &[u8],
+) -> Result<Vec<u8>, ClientError> {
+    let envelope: EncryptedEnvelopeV1 = serde_json::from_slice(encoded)
+        .map_err(|error| ClientError::Serialization(error.to_string()))?;
+    if envelope.version != 1
+        || envelope.key_version != 1
+        || envelope.algorithm != "XCHACHA20-POLY1305-LOCAL-STATE"
+        || envelope.nonce.0.len() != 24
+    {
+        return Err(ClientError::Crypto(
+            "local state envelope algorithm or version is unsupported".to_owned(),
+        ));
+    }
+    let mut key = derive_local_state_key(master_key, purpose)?;
+    let cipher = XChaCha20Poly1305::new((&key).into());
+    let aad = local_state_aad(purpose)?;
+    let plaintext = cipher
+        .decrypt(
+            XNonce::from_slice(&envelope.nonce.0),
+            Payload {
+                msg: &envelope.ciphertext.0,
+                aad: &aad,
+            },
+        )
+        .map_err(|_| {
+            ClientError::Crypto(
+                "local state authentication failed; data or context changed".to_owned(),
+            )
+        })?;
+    key.zeroize();
+    Ok(plaintext)
+}
+
 fn derive_key(
     master_key: &MasterKey,
     object_id: ObjectId,
@@ -160,6 +226,25 @@ fn derive_key(
     hkdf.expand(&info, &mut key)
         .map_err(|_| ClientError::Crypto("object key derivation failed".to_owned()))?;
     Ok(key)
+}
+
+fn derive_local_state_key(master_key: &MasterKey, purpose: &str) -> Result<[u8; 32], ClientError> {
+    let hkdf = Hkdf::<Sha256>::new(
+        Some(b"helium-sync/local-state-salt/v1"),
+        master_key.0.expose_secret(),
+    );
+    let mut info = b"helium-sync/local-state-key/v1".to_vec();
+    append_field(&mut info, purpose.as_bytes())?;
+    let mut key = [0_u8; 32];
+    hkdf.expand(&info, &mut key)
+        .map_err(|_| ClientError::Crypto("local state key derivation failed".to_owned()))?;
+    Ok(key)
+}
+
+fn local_state_aad(purpose: &str) -> Result<Vec<u8>, ClientError> {
+    let mut aad = b"helium-sync/local-state-aad/v1".to_vec();
+    append_field(&mut aad, purpose.as_bytes())?;
+    Ok(aad)
 }
 
 fn associated_data(
@@ -262,5 +347,22 @@ mod tests {
         let mut invalid = code;
         invalid.push('A');
         assert!(MasterKey::from_recovery_code(&invalid).is_err());
+    }
+
+    #[test]
+    fn local_state_is_encrypted_and_bound_to_its_context() {
+        let key = MasterKey::generate();
+        let plaintext = b"deleted bookmark retained only as a merge base";
+        let encrypted = encrypt_local_state(&key, "bookmarks:Default", plaintext).unwrap();
+        assert!(
+            !encrypted
+                .windows(plaintext.len())
+                .any(|value| value == plaintext)
+        );
+        assert_eq!(
+            decrypt_local_state(&key, "bookmarks:Default", &encrypted).unwrap(),
+            plaintext
+        );
+        assert!(decrypt_local_state(&key, "bookmarks:Work", &encrypted).is_err());
     }
 }

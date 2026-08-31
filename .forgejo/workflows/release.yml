@@ -23,8 +23,9 @@ env:
     - Windows x86_64 NSIS installer: `helium-sync-client-windows-x86_64-installer.exe`
     - macOS universal client tarball: `helium-sync-client-macos-universal.tar.gz`
 
-    Every listed artifact has a basename-only SHA-256 checksum in
-    `<artifact>.sha256` and an armored detached signature in `<artifact>.asc`.
+    `SHA256SUMS` contains a basename-only SHA-256 checksum for every listed
+    artifact. The checksum manifest and every artifact have armored detached
+    signatures.
 
     Recover the signing key using one of these methods:
 
@@ -37,7 +38,8 @@ env:
     gpg --import william.asc
 
     gpg --fingerprint 7D6EF134D851C8DA0862D97494F31AF374E2EE3C
-    sha256sum --check <artifact>.sha256
+    gpg --verify SHA256SUMS.asc SHA256SUMS
+    sha256sum --check --strict SHA256SUMS
     gpg --verify <artifact>.asc <artifact>
     ```
 
@@ -579,15 +581,18 @@ jobs:
             exit 1
           fi
 
-          for artifact in "${artifacts[@]}"; do
-            artifact_dir="$(dirname "$artifact")"
-            artifact_name="$(basename "$artifact")"
-            (
-              cd "$artifact_dir"
-              sha256sum "$artifact_name" > "$artifact_name.sha256"
-              sha256sum --check --strict "$artifact_name.sha256"
-            )
+          (
+            cd staging
+            artifact_names=()
+            for artifact in "${artifacts[@]}"; do
+              artifact_names+=("$(basename "$artifact")")
+            done
+            sha256sum "${artifact_names[@]}" > SHA256SUMS
+            sha256sum --check --strict SHA256SUMS
+          )
 
+          signed_files=("${artifacts[@]}" staging/SHA256SUMS)
+          for artifact in "${signed_files[@]}"; do
             printf '%s\n' "$CI_KEY_PASSPHRASE" \
               | gpg --batch --yes --homedir "$signing_home" \
                   --pinentry-mode loopback \
@@ -601,8 +606,8 @@ jobs:
           done
 
           file_count="$(find staging -maxdepth 1 -type f | wc -l)"
-          if [[ "$file_count" -ne 15 ]]; then
-            echo "Expected 15 release files (five artifacts, checksums, and signatures); found $file_count." >&2
+          if [[ "$file_count" -ne 12 ]]; then
+            echo "Expected 12 release files (five artifacts, one checksum manifest, and six signatures); found $file_count." >&2
             find staging -maxdepth 1 -type f -printf '%f\n' >&2
             exit 1
           fi
@@ -688,6 +693,23 @@ jobs:
             echo "Forgejo release response did not contain an id." >&2
             exit 1
           fi
+
+          legacy_checksums=(
+            helium-sync-server-linux-x86_64.tar.gz.sha256
+            helium-sync-client-linux-x86_64.tar.gz.sha256
+            helium-sync-client-windows-x86_64-portable.zip.sha256
+            helium-sync-client-windows-x86_64-installer.exe.sha256
+            helium-sync-client-macos-universal.tar.gz.sha256
+          )
+          for asset_name in "${legacy_checksums[@]}"; do
+            existing_asset_id="$(api_request GET "${api_url}/repos/${owner}/${repo}/releases/${release_id}/assets" \
+              | jq -r --arg name "$asset_name" '.[] | select(.name == $name) | .id' \
+              | head -n 1)"
+            if [[ -n "$existing_asset_id" ]]; then
+              api_request DELETE \
+                "${api_url}/repos/${owner}/${repo}/releases/${release_id}/assets/${existing_asset_id}" >/dev/null
+            fi
+          done
 
           for asset_path in staging/*; do
             if [[ ! -s "$asset_path" ]]; then
@@ -808,6 +830,23 @@ jobs:
             exit 1
           fi
           upload_url="${upload_url%\{*}"
+
+          legacy_checksums=(
+            helium-sync-server-linux-x86_64.tar.gz.sha256
+            helium-sync-client-linux-x86_64.tar.gz.sha256
+            helium-sync-client-windows-x86_64-portable.zip.sha256
+            helium-sync-client-windows-x86_64-installer.exe.sha256
+            helium-sync-client-macos-universal.tar.gz.sha256
+          )
+          for asset_name in "${legacy_checksums[@]}"; do
+            existing_asset_id="$(github_api_request GET "${github_api_url}/repos/${github_owner}/${github_repo}/releases/${release_id}/assets?per_page=100" \
+              | jq -r --arg name "$asset_name" '.[] | select(.name == $name) | .id' \
+              | head -n 1)"
+            if [[ -n "$existing_asset_id" ]]; then
+              github_api_request DELETE \
+                "${github_api_url}/repos/${github_owner}/${github_repo}/releases/assets/${existing_asset_id}" >/dev/null
+            fi
+          done
 
           for asset_path in staging/*; do
             if [[ ! -s "$asset_path" ]]; then

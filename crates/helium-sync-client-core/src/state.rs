@@ -13,6 +13,7 @@ pub struct ProfilePreference {
     pub directory_name: String,
     pub display_name: String,
     pub is_default: bool,
+    pub auto_sync: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,6 +138,63 @@ impl LocalState {
         Ok(())
     }
 
+    pub async fn save_sync_state(
+        &self,
+        server_id: &str,
+        namespace: &str,
+        local_key: &str,
+        object_id: ObjectId,
+        revision: u64,
+        snapshot_json: &[u8],
+    ) -> Result<(), ClientError> {
+        let revision =
+            i64::try_from(revision).map_err(|error| ClientError::State(error.to_string()))?;
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|error| ClientError::State(error.to_string()))?;
+        sqlx::query("INSERT INTO object_mappings (server_id, namespace, local_key, object_id, revision) VALUES (?, ?, ?, ?, ?) ON CONFLICT(server_id, namespace, local_key) DO UPDATE SET object_id=excluded.object_id, revision=excluded.revision")
+            .bind(server_id)
+            .bind(namespace)
+            .bind(local_key)
+            .bind(object_id.to_string())
+            .bind(revision)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| ClientError::State(error.to_string()))?;
+        sqlx::query("INSERT INTO sync_bases (server_id, namespace, local_key, snapshot_json) VALUES (?, ?, ?, ?) ON CONFLICT(server_id, namespace, local_key) DO UPDATE SET snapshot_json=excluded.snapshot_json, updated_at=CURRENT_TIMESTAMP")
+            .bind(server_id)
+            .bind(namespace)
+            .bind(local_key)
+            .bind(snapshot_json)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| ClientError::State(error.to_string()))?;
+        transaction
+            .commit()
+            .await
+            .map_err(|error| ClientError::State(error.to_string()))?;
+        Ok(())
+    }
+
+    pub async fn sync_base(
+        &self,
+        server_id: &str,
+        namespace: &str,
+        local_key: &str,
+    ) -> Result<Option<Vec<u8>>, ClientError> {
+        sqlx::query_scalar(
+            "SELECT snapshot_json FROM sync_bases WHERE server_id=? AND namespace=? AND local_key=?",
+        )
+        .bind(server_id)
+        .bind(namespace)
+        .bind(local_key)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| ClientError::State(error.to_string()))
+    }
+
     pub async fn mapping(
         &self,
         server_id: &str,
@@ -184,7 +242,7 @@ impl LocalState {
 
     pub async fn profile_preferences(&self) -> Result<Vec<ProfilePreference>, ClientError> {
         let rows = sqlx::query(
-            "SELECT directory_name, display_name, is_default FROM profile_preferences ORDER BY display_name COLLATE NOCASE, directory_name",
+            "SELECT directory_name, display_name, is_default, auto_sync FROM profile_preferences ORDER BY display_name COLLATE NOCASE, directory_name",
         )
         .fetch_all(&self.pool)
         .await
@@ -195,6 +253,7 @@ impl LocalState {
                 directory_name: row.get("directory_name"),
                 display_name: row.get("display_name"),
                 is_default: row.get::<i64, _>("is_default") == 1,
+                auto_sync: row.get::<i64, _>("auto_sync") == 1,
             })
             .collect())
     }
@@ -255,6 +314,25 @@ impl LocalState {
         Ok(())
     }
 
+    pub async fn set_auto_sync(
+        &self,
+        directory_name: &str,
+        enabled: bool,
+    ) -> Result<(), ClientError> {
+        let result = sqlx::query(
+            "UPDATE profile_preferences SET auto_sync=?, updated_at=CURRENT_TIMESTAMP WHERE directory_name=?",
+        )
+        .bind(i64::from(enabled))
+        .bind(directory_name)
+        .execute(&self.pool)
+        .await
+        .map_err(|error| ClientError::State(error.to_string()))?;
+        if result.rows_affected() != 1 {
+            return Err(ClientError::State("profile is not registered".to_owned()));
+        }
+        Ok(())
+    }
+
     pub async fn default_profile(&self) -> Result<Option<ProfilePreference>, ClientError> {
         Ok(self
             .profile_preferences()
@@ -300,9 +378,20 @@ mod tests {
         state.ensure_profile("Profile 2", "Work").await.unwrap();
         state.rename_profile("Default", "Personal").await.unwrap();
         state.set_default_profile("Default").await.unwrap();
+        state.set_auto_sync("Profile 2", false).await.unwrap();
 
         let profiles = state.profile_preferences().await.unwrap();
         assert_eq!(profiles.len(), 2);
+        assert!(
+            profiles
+                .iter()
+                .any(|profile| { profile.directory_name == "Default" && profile.auto_sync })
+        );
+        assert!(
+            profiles
+                .iter()
+                .any(|profile| { profile.directory_name == "Profile 2" && !profile.auto_sync })
+        );
         assert_eq!(
             state.default_profile().await.unwrap().unwrap().display_name,
             "Personal"
@@ -333,6 +422,36 @@ mod tests {
                 object_id,
                 revision: 4
             })
+        );
+
+        let snapshot = br#"{"format":"helium-bookmarks-v1"}"#;
+        state
+            .save_sync_state(
+                "server",
+                "helium.bookmarks.v1",
+                "Profile 2",
+                object_id,
+                5,
+                snapshot,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            state
+                .sync_base("server", "helium.bookmarks.v1", "Profile 2")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(snapshot.as_slice())
+        );
+        assert_eq!(
+            state
+                .mapping("server", "helium.bookmarks.v1", "Profile 2")
+                .await
+                .unwrap()
+                .unwrap()
+                .revision,
+            5
         );
     }
 }

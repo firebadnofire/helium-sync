@@ -83,6 +83,12 @@ button.primary:hover:not(:disabled) { background: #81ecc6; }
 .chip.warning { color: var(--warning); border-color: #765b2c; background: #332610; }
 .profile-actions { display: flex; gap: 7px; justify-content: flex-end; flex-wrap: wrap; }
 .profile-actions button { padding: 7px 10px; font-size: 12px; }
+.auto-sync-toggle { flex-direction: row; align-items: center; gap: 6px; border: 1px solid #3b554e; border-radius: 9px; background: #182822; padding: 7px 10px; font-size: 12px; font-weight: 500; cursor: pointer; }
+.auto-sync-toggle input { width: auto; accent-color: var(--accent); }
+.profile-recovery { position: relative; font-size: 12px; }
+.profile-recovery summary { list-style: none; border: 1px solid #3b554e; border-radius: 9px; background: #182822; padding: 7px 10px; cursor: pointer; }
+.profile-recovery summary::-webkit-details-marker { display: none; }
+.profile-recovery[open] { display: flex; gap: 7px; flex-wrap: wrap; justify-content: flex-end; }
 .empty-state { border: 1px dashed var(--line); border-radius: 12px; color: var(--muted); padding: 28px; text-align: center; }
 .error-text { color: var(--danger); }
 .feedback { display: grid; gap: 5px; margin-top: 18px; border: 1px solid #347d64; border-radius: 11px; background: #0c211a; padding: 14px 16px; }

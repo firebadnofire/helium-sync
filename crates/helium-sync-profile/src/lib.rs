@@ -43,6 +43,8 @@ pub enum ProfileError {
         snapshot_profile: String,
         selected_profile: String,
     },
+    #[error("bookmark snapshots cannot be merged: {0}")]
+    IncompatibleSnapshot(String),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -125,6 +127,12 @@ pub struct BookmarkStats {
 pub struct RestoreResult {
     pub backup_path: PathBuf,
     pub stats: BookmarkStats,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BookmarkMergeResult {
+    pub snapshot: BookmarkSnapshotV1,
+    pub conflicts: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -375,6 +383,305 @@ pub fn bookmark_stats(snapshot: &BookmarkSnapshotV1) -> BookmarkStats {
         bytes: serde_json::to_vec(snapshot)
             .map_or(0, |bytes| u64::try_from(bytes.len()).unwrap_or(u64::MAX)),
     }
+}
+
+/// Reconciles local and remote bookmark snapshots against their last common state.
+///
+/// Independent changes are combined. When one side deletes a node while the other modifies it,
+/// the modified node is retained. Concurrent edits to the same scalar field choose the remote
+/// value deterministically and increment the conflict count.
+///
+/// # Errors
+///
+/// Returns [`ProfileError::IncompatibleSnapshot`] when snapshots use different formats, browser
+/// sources, or profile directories.
+pub fn merge_bookmarks(
+    base: Option<&BookmarkSnapshotV1>,
+    local: &BookmarkSnapshotV1,
+    remote: &BookmarkSnapshotV1,
+) -> Result<BookmarkMergeResult, ProfileError> {
+    validate_merge_pair(local, remote)?;
+    if let Some(base) = base {
+        validate_merge_pair(base, local)?;
+    }
+
+    let base_roots = base.map_or_else(BTreeMap::new, |snapshot| {
+        snapshot
+            .roots
+            .iter()
+            .map(|root| (root.key.as_str(), &root.node))
+            .collect()
+    });
+    let local_roots = local
+        .roots
+        .iter()
+        .map(|root| (root.key.as_str(), &root.node))
+        .collect::<BTreeMap<_, _>>();
+    let remote_roots = remote
+        .roots
+        .iter()
+        .map(|root| (root.key.as_str(), &root.node))
+        .collect::<BTreeMap<_, _>>();
+    let mut keys = Vec::new();
+    let mut seen = BTreeSet::new();
+    for root in remote
+        .roots
+        .iter()
+        .chain(local.roots.iter())
+        .chain(base.into_iter().flat_map(|snapshot| snapshot.roots.iter()))
+    {
+        if seen.insert(root.key.as_str()) {
+            keys.push(root.key.clone());
+        }
+    }
+
+    let mut conflicts = 0;
+    let roots = keys
+        .into_iter()
+        .filter_map(|key| {
+            merge_optional_node(
+                base_roots.get(key.as_str()).copied(),
+                local_roots.get(key.as_str()).copied(),
+                remote_roots.get(key.as_str()).copied(),
+                &mut conflicts,
+            )
+            .map(|node| BookmarkRoot { key, node })
+        })
+        .collect();
+    Ok(BookmarkMergeResult {
+        snapshot: BookmarkSnapshotV1 {
+            format: remote.format.clone(),
+            source_browser: remote.source_browser.clone(),
+            profile_directory: remote.profile_directory.clone(),
+            chromium_version: local.chromium_version.max(remote.chromium_version),
+            roots,
+        },
+        conflicts,
+    })
+}
+
+fn validate_merge_pair(
+    left: &BookmarkSnapshotV1,
+    right: &BookmarkSnapshotV1,
+) -> Result<(), ProfileError> {
+    if left.format != right.format
+        || left.source_browser != right.source_browser
+        || left.profile_directory != right.profile_directory
+    {
+        return Err(ProfileError::IncompatibleSnapshot(format!(
+            "{}:{}:{} does not match {}:{}:{}",
+            left.format,
+            left.source_browser,
+            left.profile_directory,
+            right.format,
+            right.source_browser,
+            right.profile_directory
+        )));
+    }
+    Ok(())
+}
+
+fn merge_optional_node(
+    base: Option<&BookmarkNode>,
+    local: Option<&BookmarkNode>,
+    remote: Option<&BookmarkNode>,
+    conflicts: &mut u64,
+) -> Option<BookmarkNode> {
+    if local == remote {
+        return local.cloned();
+    }
+    if local == base {
+        return remote.cloned();
+    }
+    if remote == base {
+        return local.cloned();
+    }
+    match (base, local, remote) {
+        (_, Some(local), Some(remote)) => Some(merge_present_node(base, local, remote, conflicts)),
+        (Some(_), None, Some(remote)) => {
+            *conflicts += 1;
+            Some(remote.clone())
+        }
+        (Some(_), Some(local), None) => {
+            *conflicts += 1;
+            Some(local.clone())
+        }
+        _ => None,
+    }
+}
+
+fn merge_present_node(
+    base: Option<&BookmarkNode>,
+    local: &BookmarkNode,
+    remote: &BookmarkNode,
+    conflicts: &mut u64,
+) -> BookmarkNode {
+    match (local, remote) {
+        (
+            BookmarkNode::Folder {
+                id: local_id,
+                name: local_name,
+                date_added: local_added,
+                date_modified: local_modified,
+                children: local_children,
+            },
+            BookmarkNode::Folder {
+                id: remote_id,
+                name: remote_name,
+                date_added: remote_added,
+                date_modified: remote_modified,
+                children: remote_children,
+            },
+        ) if local_id == remote_id => {
+            let base_folder = match base {
+                Some(BookmarkNode::Folder {
+                    id,
+                    name,
+                    date_added,
+                    date_modified,
+                    children,
+                }) if id == local_id => Some((name, date_added, date_modified, children)),
+                _ => None,
+            };
+            BookmarkNode::Folder {
+                id: local_id.clone(),
+                name: merge_value(
+                    base_folder.map(|value| value.0),
+                    local_name,
+                    remote_name,
+                    conflicts,
+                ),
+                date_added: merge_value(
+                    base_folder.map(|value| value.1),
+                    local_added,
+                    remote_added,
+                    conflicts,
+                ),
+                date_modified: merge_value(
+                    base_folder.map(|value| value.2),
+                    local_modified,
+                    remote_modified,
+                    conflicts,
+                ),
+                children: merge_children(
+                    base_folder.map(|value| value.3.as_slice()),
+                    local_children,
+                    remote_children,
+                    conflicts,
+                ),
+            }
+        }
+        (
+            BookmarkNode::Url {
+                id: local_id,
+                name: local_name,
+                url: local_url,
+                date_added: local_added,
+            },
+            BookmarkNode::Url {
+                id: remote_id,
+                name: remote_name,
+                url: remote_url,
+                date_added: remote_added,
+            },
+        ) if local_id == remote_id => {
+            let base_url = match base {
+                Some(BookmarkNode::Url {
+                    id,
+                    name,
+                    url,
+                    date_added,
+                }) if id == local_id => Some((name, url, date_added)),
+                _ => None,
+            };
+            BookmarkNode::Url {
+                id: local_id.clone(),
+                name: merge_value(
+                    base_url.map(|value| value.0),
+                    local_name,
+                    remote_name,
+                    conflicts,
+                ),
+                url: merge_value(
+                    base_url.map(|value| value.1),
+                    local_url,
+                    remote_url,
+                    conflicts,
+                ),
+                date_added: merge_value(
+                    base_url.map(|value| value.2),
+                    local_added,
+                    remote_added,
+                    conflicts,
+                ),
+            }
+        }
+        _ => {
+            *conflicts += 1;
+            remote.clone()
+        }
+    }
+}
+
+fn merge_children(
+    base: Option<&[BookmarkNode]>,
+    local: &[BookmarkNode],
+    remote: &[BookmarkNode],
+    conflicts: &mut u64,
+) -> Vec<BookmarkNode> {
+    let base_nodes = base.map_or_else(BTreeMap::new, |nodes| node_map(nodes));
+    let local_nodes = node_map(local);
+    let remote_nodes = node_map(remote);
+    let mut ids = Vec::new();
+    let mut seen = BTreeSet::new();
+    for node in remote
+        .iter()
+        .chain(local.iter())
+        .chain(base.into_iter().flatten())
+    {
+        if seen.insert(node_id(node)) {
+            ids.push(node_id(node).to_owned());
+        }
+    }
+    ids.into_iter()
+        .filter_map(|id| {
+            merge_optional_node(
+                base_nodes.get(id.as_str()).copied(),
+                local_nodes.get(id.as_str()).copied(),
+                remote_nodes.get(id.as_str()).copied(),
+                conflicts,
+            )
+        })
+        .collect()
+}
+
+fn node_map(nodes: &[BookmarkNode]) -> BTreeMap<&str, &BookmarkNode> {
+    nodes.iter().map(|node| (node_id(node), node)).collect()
+}
+
+fn node_id(node: &BookmarkNode) -> &str {
+    match node {
+        BookmarkNode::Folder { id, .. } | BookmarkNode::Url { id, .. } => id,
+    }
+}
+
+fn merge_value<T: Clone + PartialEq>(
+    base: Option<&T>,
+    local: &T,
+    remote: &T,
+    conflicts: &mut u64,
+) -> T {
+    if local == remote {
+        return local.clone();
+    }
+    if Some(local) == base {
+        return remote.clone();
+    }
+    if Some(remote) == base {
+        return local.clone();
+    }
+    *conflicts += 1;
+    remote.clone()
 }
 
 /// Restores a bookmark snapshot after archiving the current local file in `downloads_dir`.
@@ -724,6 +1031,41 @@ mod tests {
       }
     }"#;
 
+    fn bookmark(id: &str, name: &str) -> BookmarkNode {
+        BookmarkNode::Url {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            url: format!("https://{name}.example/"),
+            date_added: None,
+        }
+    }
+
+    fn snapshot(children: Vec<BookmarkNode>) -> BookmarkSnapshotV1 {
+        BookmarkSnapshotV1 {
+            format: "helium-bookmarks-v1".to_owned(),
+            source_browser: "helium".to_owned(),
+            profile_directory: "Default".to_owned(),
+            chromium_version: 1,
+            roots: vec![BookmarkRoot {
+                key: "bookmark_bar".to_owned(),
+                node: BookmarkNode::Folder {
+                    id: "1".to_owned(),
+                    name: "Bookmarks bar".to_owned(),
+                    date_added: None,
+                    date_modified: None,
+                    children,
+                },
+            }],
+        }
+    }
+
+    fn merged_children(result: &BookmarkMergeResult) -> &[BookmarkNode] {
+        match &result.snapshot.roots[0].node {
+            BookmarkNode::Folder { children, .. } => children,
+            BookmarkNode::Url { .. } => panic!("expected bookmark-bar folder"),
+        }
+    }
+
     #[test]
     fn discovers_fixture_and_parses_bookmarks() {
         let temp = tempfile::tempdir().unwrap();
@@ -819,5 +1161,48 @@ mod tests {
         );
         archived_bookmarks.read_to_string(&mut original).unwrap();
         assert_eq!(original, BOOKMARKS);
+    }
+
+    #[test]
+    fn three_way_merge_combines_independent_additions() {
+        let base = snapshot(vec![bookmark("2", "base")]);
+        let local = snapshot(vec![bookmark("2", "base"), bookmark("3", "local")]);
+        let remote = snapshot(vec![bookmark("2", "base"), bookmark("4", "remote")]);
+
+        let merged = merge_bookmarks(Some(&base), &local, &remote).unwrap();
+        assert_eq!(merged.conflicts, 0);
+        assert_eq!(merged_children(&merged).len(), 3);
+        assert!(
+            merged_children(&merged)
+                .iter()
+                .any(|node| node_id(node) == "3")
+        );
+        assert!(
+            merged_children(&merged)
+                .iter()
+                .any(|node| node_id(node) == "4")
+        );
+    }
+
+    #[test]
+    fn three_way_merge_propagates_deletion_when_other_side_is_unchanged() {
+        let base = snapshot(vec![bookmark("2", "remove")]);
+        let local = snapshot(vec![]);
+        let remote = base.clone();
+
+        let merged = merge_bookmarks(Some(&base), &local, &remote).unwrap();
+        assert_eq!(merged.conflicts, 0);
+        assert!(merged_children(&merged).is_empty());
+    }
+
+    #[test]
+    fn three_way_merge_keeps_modification_over_concurrent_deletion() {
+        let base = snapshot(vec![bookmark("2", "before")]);
+        let local = snapshot(vec![bookmark("2", "after")]);
+        let remote = snapshot(vec![]);
+
+        let merged = merge_bookmarks(Some(&base), &local, &remote).unwrap();
+        assert_eq!(merged.conflicts, 1);
+        assert_eq!(merged_children(&merged), &[bookmark("2", "after")]);
     }
 }

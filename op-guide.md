@@ -4,9 +4,9 @@ This guide takes a new operator from an empty machine to a working Helium Sync
 server and desktop client. It also covers verification, routine operation,
 upgrades, backup, restore, rollback, and the failures most likely to occur.
 
-Helium Sync is currently an encrypted bookmark export and verification proof.
-It is not continuous browser synchronization, and it never writes retrieved
-bookmarks into a live Helium profile.
+Helium Sync provides encrypted multi-device bookmark synchronization while the
+desktop client is open and signed in. It does not yet synchronize open tabs,
+history, passwords, extensions, or browser preferences.
 
 ## Contents
 
@@ -695,19 +695,24 @@ source rather than changing host-key policy.
 Use this sequence:
 
 1. Connect and review every diagnostic stage.
-2. Run the synthetic encrypted round trip.
-3. Export the `hsync1:` recovery code.
-4. Store the recovery code offline in a password manager or other protected
+2. Select a readable Helium profile and choose **Use at sign-in**.
+3. Reveal the `hsync1:` recovery code from the security and recovery section.
+4. Store the recovery code offline in a password manager or another protected
    backup. Do not store it on the server.
-5. Refresh Helium profiles.
-6. Select a profile whose bookmark file is readable.
-7. Run encrypted bookmark export verification.
+5. Choose **Sync now**, or leave **Automatic** enabled for 30-second checks
+   while the desktop client remains open and signed in.
+6. On every additional trusted device, import the exact recovery code before
+   signing in. The client discovers the encrypted server object for a matching
+   profile-directory name and reconciles it with local bookmarks.
 
 The first client creates a random 256-bit master key. The recovery code is the
 only supported way to put the same master key on another trusted client. A
 server database backup cannot decrypt data without it.
 
-The initial workflow never restores bookmarks into the live profile.
+Local changes can upload while Helium is open. Close Helium before a device
+needs to apply server changes locally. The client refuses to replace the
+`Bookmarks` file while the installed Helium executable is running and creates
+a Zstandard-compressed ZIP backup in Downloads before every replacement.
 
 ## 10. Routine operations
 
@@ -1006,7 +1011,8 @@ space, or migration errors. Do not delete the database to make startup pass.
 ### Bookmarks unavailable or busy
 
 - Verify Helium is installed and its `Local State` lists the profile.
-- The initial proof reads only the `Bookmarks` JSON file.
+- Bookmark synchronization reads and may guardedly replace only the `Bookmarks`
+  JSON file.
 - If metadata changes during the read, pause bookmark edits or close Helium and
   retry.
 - Never copy or edit the live browser SQLite/LevelDB stores as a workaround.
@@ -1049,9 +1055,9 @@ keys, recovery codes, bookmark contents, and sensitive filesystem paths.
 - [ ] Firewall exposure is limited to trusted networks and required ports.
 - [ ] The server database, token, and TLS keys have protected backups.
 - [ ] Every client recovery code has a separate protected offline backup.
-- [ ] A synthetic encrypted round trip passes after every deployment change.
-- [ ] Restored bookmarks are never written into a live profile by this initial
-      release.
+- [ ] An encrypted bookmark round trip passes after every deployment change.
+- [ ] Helium is closed before applying server bookmark changes locally.
+- [ ] Zstandard backup archives are created before local bookmark replacement.
 
 Additional focused documentation is available under [`docs/`](docs/),
 including [TLS](docs/tls.md), [SSH](docs/ssh.md),

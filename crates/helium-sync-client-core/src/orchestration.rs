@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use helium_sync_common::{DeviceId, ObjectId, PutObjectRequest, RegisterDeviceRequest, Timestamp};
 use helium_sync_profile::{BookmarkSnapshotV1, DiscoveredProfile, read_bookmarks};
@@ -53,6 +53,30 @@ impl ClientCore {
         }
     }
 
+    pub fn protect_sync_base(
+        &self,
+        profile_directory: &str,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, ClientError> {
+        crypto::encrypt_local_state(
+            &self.master_key,
+            &format!("{BOOKMARK_NAMESPACE}:{profile_directory}"),
+            plaintext,
+        )
+    }
+
+    pub fn open_sync_base(
+        &self,
+        profile_directory: &str,
+        encrypted: &[u8],
+    ) -> Result<Vec<u8>, ClientError> {
+        crypto::decrypt_local_state(
+            &self.master_key,
+            &format!("{BOOKMARK_NAMESPACE}:{profile_directory}"),
+            encrypted,
+        )
+    }
+
     pub async fn synthetic_round_trip(&self) -> Result<SyncProof, ClientError> {
         self.round_trip("synthetic.v1", SYNTHETIC_SENTINEL.as_bytes())
             .await
@@ -77,19 +101,29 @@ impl ClientCore {
         object_id: Option<ObjectId>,
         base_revision: Option<u64>,
     ) -> Result<(SyncProof, BookmarkSnapshotV1), ClientError> {
+        let snapshot = read_bookmarks(&profile.bookmarks_path, &profile.directory_name)?;
+        let proof = self
+            .save_bookmark_snapshot(&snapshot, object_id, base_revision)
+            .await?;
+        Ok((proof, snapshot))
+    }
+
+    pub async fn save_bookmark_snapshot(
+        &self,
+        snapshot: &BookmarkSnapshotV1,
+        object_id: Option<ObjectId>,
+        base_revision: Option<u64>,
+    ) -> Result<SyncProof, ClientError> {
         if object_id.is_some() != base_revision.is_some() {
             return Err(ClientError::State(
                 "bookmark object ID and revision must either both exist or both be absent"
                     .to_owned(),
             ));
         }
-        let snapshot = read_bookmarks(&profile.bookmarks_path, &profile.directory_name)?;
         let plaintext = serde_json::to_vec(&snapshot)
             .map_err(|error| ClientError::Serialization(error.to_string()))?;
-        let proof = self
-            .upload(BOOKMARK_NAMESPACE, &plaintext, object_id, base_revision)
-            .await?;
-        Ok((proof, snapshot))
+        self.upload(BOOKMARK_NAMESPACE, &plaintext, object_id, base_revision)
+            .await
     }
 
     pub async fn load_bookmarks(
@@ -118,6 +152,44 @@ impl ClientCore {
         ))
     }
 
+    pub async fn discover_bookmarks(
+        &self,
+        profile_directory: &str,
+    ) -> Result<Option<(BookmarkSnapshotV1, SyncProof)>, ClientError> {
+        let mut after = 0;
+        let mut candidates = HashMap::new();
+        loop {
+            let page = self.api.changes(after).await?;
+            for change in page.changes {
+                if change.namespace == BOOKMARK_NAMESPACE {
+                    candidates.insert(change.object_id, (change.cursor, change.deleted));
+                }
+            }
+            if !page.has_more {
+                break;
+            }
+            if page.next_cursor <= after {
+                return Err(ClientError::Serialization(
+                    "server change cursor did not advance".to_owned(),
+                ));
+            }
+            after = page.next_cursor;
+        }
+
+        let mut candidates = candidates
+            .into_iter()
+            .filter_map(|(object_id, (cursor, deleted))| (!deleted).then_some((object_id, cursor)))
+            .collect::<Vec<_>>();
+        candidates.sort_unstable_by_key(|(_, cursor)| std::cmp::Reverse(*cursor));
+        for (object_id, _) in candidates {
+            let (snapshot, proof) = self.load_bookmarks(object_id).await?;
+            if snapshot.profile_directory == profile_directory {
+                return Ok(Some((snapshot, proof)));
+            }
+        }
+        Ok(None)
+    }
+
     async fn round_trip(
         &self,
         namespace: &str,
@@ -133,7 +205,7 @@ impl ClientCore {
         object_id: Option<ObjectId>,
         base_revision: Option<u64>,
     ) -> Result<SyncProof, ClientError> {
-        let object_id = object_id.unwrap_or_else(ObjectId::new);
+        let object_id = object_id.unwrap_or_default();
         let revision = base_revision.map_or(1, |revision| revision.saturating_add(1));
         let modified_at = Timestamp::now_utc();
         let metadata = ObjectMetadata {
@@ -298,5 +370,65 @@ mod tests {
             .unwrap();
         assert_eq!(second.object_id, first.object_id);
         assert_eq!(second.revision, 2);
+    }
+
+    #[tokio::test]
+    async fn second_device_discovers_existing_encrypted_profile() {
+        let pool = helium_sync_server::storage::memory().await.unwrap();
+        let state = helium_sync_server::api::AppState::new(
+            pool,
+            &SecretString::from("0123456789abcdef0123456789abcdef".to_owned()),
+        );
+        let router = helium_sync_server::router(state);
+        let token = || SecretString::from("0123456789abcdef0123456789abcdef".to_owned());
+        let first_key = MasterKey::generate();
+        let recovery_code = first_key.recovery_code();
+        let first = ClientCore::new(
+            Arc::new(ApiClient::new(
+                Arc::new(RouterTransport {
+                    router: router.clone(),
+                }),
+                token(),
+            )),
+            first_key,
+            DeviceId::new(),
+        );
+        let second = ClientCore::new(
+            Arc::new(ApiClient::new(
+                Arc::new(RouterTransport { router }),
+                token(),
+            )),
+            MasterKey::from_recovery_code(&recovery_code).unwrap(),
+            DeviceId::new(),
+        );
+        first.register_device("first device").await.unwrap();
+        second.register_device("second device").await.unwrap();
+
+        let temp = tempfile::tempdir().unwrap();
+        let profile_path = temp.path().join("Default");
+        std::fs::create_dir(&profile_path).unwrap();
+        let bookmarks_path = profile_path.join("Bookmarks");
+        std::fs::write(
+            &bookmarks_path,
+            r#"{"version":1,"roots":{"bookmark_bar":{"type":"folder","id":"1","name":"Bookmarks bar","children":[{"type":"url","id":"2","name":"Example","url":"https://example.com/"}]}}}"#,
+        )
+        .unwrap();
+        let profile = helium_sync_profile::DiscoveredProfile {
+            directory_name: "Default".to_owned(),
+            display_name: "Personal".to_owned(),
+            path: profile_path,
+            bookmarks_path,
+            bookmark_status: helium_sync_profile::BookmarkStatus::Readable,
+        };
+
+        let (saved, expected) = first.save_bookmarks(&profile, None, None).await.unwrap();
+        let (discovered, proof) = second
+            .discover_bookmarks("Default")
+            .await
+            .unwrap()
+            .expect("second device should find the first device's profile");
+        assert_eq!(discovered, expected);
+        assert_eq!(proof.object_id, saved.object_id);
+        assert_eq!(proof.revision, saved.revision);
     }
 }

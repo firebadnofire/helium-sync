@@ -48,4 +48,4 @@ npm ci
 npm run tauri dev
 ```
 
-For the generated certificate, select custom CA and choose `server.crt`. Sign in, save the bearer token in the native secret store, choose a default profile, and use Save/Load from the Profiles screen. Load creates a Zstandard-compressed ZIP backup in Downloads before replacing local bookmarks.
+For the generated certificate, select custom CA and choose `server.crt`. Sign in, choose a default profile, and use **Sync now** or leave **Automatic** enabled. Import the first device's `hsync1:` recovery code on every additional trusted device. Close Helium when a device needs to apply server changes locally; a Zstandard-compressed ZIP backup is created in Downloads before replacement.

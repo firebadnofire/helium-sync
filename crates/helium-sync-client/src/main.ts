@@ -10,6 +10,7 @@ type Profile = {
   browserName: string;
   bookmarkStatus: BookmarkStatus;
   isDefault: boolean;
+  autoSync: boolean;
   hasSavedCopy: boolean;
   stats: BookmarkStats | null;
 };
@@ -17,11 +18,12 @@ type ProfileReport = { profiles: Profile[] };
 type DiagnosticCheck = { name: string; ok: boolean; summary: string; details: string };
 type DiagnosticReport = { checks: DiagnosticCheck[] };
 type SyncFeedback = {
-  action: "saved" | "loaded";
+  action: "saved" | "loaded" | "synced";
   profileDirectory: string;
   profileName: string;
   stats: BookmarkStats;
   revision: number;
+  conflicts: number;
   backupPath: string | null;
   message: string;
 };
@@ -33,7 +35,7 @@ app.innerHTML = `
     <div>
       <p class="eyebrow">PRIVATE BOOKMARK SYNC</p>
       <h1>Helium Sync</h1>
-      <p class="subtitle">Save and restore encrypted Helium bookmark profiles through your server.</p>
+      <p class="subtitle">Keep encrypted Helium bookmarks consistent across your devices.</p>
     </div>
     <span id="connection-badge" class="badge idle">Signed out</span>
   </header>
@@ -49,7 +51,7 @@ app.innerHTML = `
         <div><p class="eyebrow">LOCAL HELIUM</p><h2>Profiles</h2></div>
         <button id="refresh-profiles" type="button">Refresh</button>
       </div>
-      <p class="muted profile-intro">Select a profile to manage it. The default profile is synchronized automatically when you sign in.</p>
+      <p class="muted profile-intro">Sync now or leave automatic sync enabled while this desktop client is open. Every local replacement is backed up first.</p>
       <div id="profile-list" class="profile-list" aria-live="polite"></div>
       <section id="sync-feedback" class="feedback hidden" aria-live="polite"></section>
     </section>
@@ -63,8 +65,8 @@ app.innerHTML = `
         </div>
       </div>
       <aside class="login-note">
-        <strong>Sign in also syncs your default profile.</strong>
-        <span>The first sign-in saves it. Later sign-ins load the server copy after backing up the local Bookmarks file to Downloads.</span>
+        <strong>Sign in reconciles your default profile.</strong>
+        <span>Local and server changes are merged. If the local Bookmarks file changes, its previous version is first backed up with Zstandard compression in Downloads.</span>
       </aside>
 
       <form id="https-form" class="form-grid">
@@ -120,6 +122,8 @@ app.innerHTML = `
 let connected = false;
 let profiles: Profile[] = [];
 let selectedProfile: string | null = null;
+const syncInProgress = new Set<string>();
+const AUTOMATIC_SYNC_INTERVAL_MS = 30_000;
 
 const byId = <T extends HTMLElement>(id: string) => document.querySelector<T>(`#${id}`)!;
 const value = (id: string) => byId<HTMLInputElement>(id).value;
@@ -244,7 +248,7 @@ function renderProfiles(error?: string) {
     card.className = `profile-card${selected ? " selected" : ""}`;
     card.tabIndex = 0;
     card.addEventListener("click", (event) => {
-      if ((event.target as HTMLElement).closest("button, input")) return;
+      if ((event.target as HTMLElement).closest("button, input, label, summary, details")) return;
       selectedProfile = profile.directoryName;
       renderProfiles();
     });
@@ -283,6 +287,7 @@ function renderProfiles(error?: string) {
     chips.className = "chips";
     chips.append(
       chip(profile.isDefault ? "Default at sign-in" : "Manual", profile.isDefault ? "default" : ""),
+      chip(profile.autoSync ? "Auto sync on" : "Auto sync off", profile.autoSync ? "saved" : ""),
       chip(profile.hasSavedCopy ? "Saved on server" : "Not saved yet", profile.hasSavedCopy ? "saved" : ""),
       chip(readable ? "Ready" : bookmarkStatus(profile.bookmarkStatus), readable ? "ready" : "warning"),
     );
@@ -301,20 +306,38 @@ function renderProfiles(error?: string) {
     makeDefault.textContent = profile.isDefault ? "Default" : "Use at sign-in";
     makeDefault.disabled = profile.isDefault;
     makeDefault.addEventListener("click", () => void setDefault(profile));
+    const autoSync = document.createElement("label");
+    autoSync.className = "auto-sync-toggle";
+    const autoSyncCheckbox = document.createElement("input");
+    autoSyncCheckbox.type = "checkbox";
+    autoSyncCheckbox.checked = profile.autoSync;
+    autoSyncCheckbox.addEventListener("change", () => void setAutoSync(profile, autoSyncCheckbox.checked));
+    autoSync.append(autoSyncCheckbox, document.createTextNode("Automatic"));
+    const sync = document.createElement("button");
+    sync.type = "button";
+    sync.className = "primary";
+    sync.textContent = "Sync now";
+    sync.title = "Reconcile local and server bookmarks without discarding independent changes";
+    sync.disabled = !connected || !readable || syncInProgress.has(profile.directoryName);
+    sync.addEventListener("click", () => void runProfileAction("sync_profile", profile));
+    const recovery = document.createElement("details");
+    recovery.className = "profile-recovery";
+    const recoverySummary = document.createElement("summary");
+    recoverySummary.textContent = "Recovery";
     const save = document.createElement("button");
     save.type = "button";
-    save.className = "primary";
-    save.textContent = "Save";
-    save.title = "Encrypt and save the current local bookmarks to the server";
+    save.textContent = "Replace server copy";
+    save.title = "Recovery action: replace the server copy with current local bookmarks";
     save.disabled = !connected || !readable;
     save.addEventListener("click", () => void runProfileAction("save_profile", profile));
     const load = document.createElement("button");
     load.type = "button";
-    load.textContent = "Load";
-    load.title = "Back up the local Bookmarks file, then load the saved server copy";
+    load.textContent = "Restore server copy";
+    load.title = "Recovery action: back up local bookmarks, then replace them with the server copy";
     load.disabled = !connected || !profile.hasSavedCopy;
     load.addEventListener("click", () => void confirmLoad(profile));
-    actions.append(makeDefault, save, load);
+    recovery.append(recoverySummary, save, load);
+    actions.append(makeDefault, autoSync, sync, recovery);
 
     card.append(selector, identity, stats, actions);
     list.append(card);
@@ -369,6 +392,21 @@ async function setDefault(profile: Profile) {
   finally { setBusy(false); }
 }
 
+async function setAutoSync(profile: Profile, enabled: boolean) {
+  try {
+    const report = await invoke<ProfileReport>("set_profile_auto_sync", {
+      profileDirectory: profile.directoryName,
+      enabled,
+    });
+    profiles = report.profiles;
+    renderProfiles();
+    toast(`Automatic sync ${enabled ? "enabled" : "disabled"} for ${profile.displayName}.`, false);
+  } catch (error) {
+    toast(String(error), true);
+    await discover();
+  }
+}
+
 function confirmLoad(profile: Profile) {
   const confirmed = window.confirm(
     `Load the saved copy into ${profile.displayName}?\n\nThe current local Bookmarks file will first be backed up as a ZIP in Downloads. Close Helium before continuing so it cannot overwrite the restored file.`,
@@ -376,22 +414,44 @@ function confirmLoad(profile: Profile) {
   if (confirmed) void runProfileAction("load_profile", profile);
 }
 
-async function runProfileAction(command: "save_profile" | "load_profile", profile: Profile) {
-  setBusy(true);
+async function runProfileAction(
+  command: "save_profile" | "load_profile" | "sync_profile",
+  profile: Profile,
+  background = false,
+) {
+  if (syncInProgress.has(profile.directoryName)) return;
+  syncInProgress.add(profile.directoryName);
+  if (!background) setBusy(true);
   try {
     const feedback = await invoke<SyncFeedback>(command, { profileDirectory: profile.directoryName });
     renderFeedback(feedback);
     await discover();
-    toast(feedback.message, false);
+    if (!background) toast(feedback.message, false);
   } catch (error) { toast(String(error), true); }
-  finally { setBusy(false); }
+  finally {
+    syncInProgress.delete(profile.directoryName);
+    if (!background) setBusy(false);
+  }
+}
+
+async function runAutomaticSync() {
+  if (!connected) return;
+  const enabled = profiles.filter(
+    (profile) => profile.autoSync && profile.bookmarkStatus === "readable",
+  );
+  for (const profile of enabled) {
+    await runProfileAction("sync_profile", profile, true);
+  }
 }
 
 function renderFeedback(feedback: SyncFeedback) {
   const panel = byId("sync-feedback");
   panel.replaceChildren();
   const title = document.createElement("strong");
-  title.textContent = `${feedback.action === "saved" ? "Saved" : "Loaded"} ${feedback.profileName}`;
+  const action = feedback.action === "saved" ? "Saved"
+    : feedback.action === "loaded" ? "Loaded"
+      : "Synchronized";
+  title.textContent = `${action} ${feedback.profileName}`;
   const summary = document.createElement("span");
   summary.textContent = `${feedback.stats.bookmarks.toLocaleString()} bookmarks · ${feedback.stats.folders.toLocaleString()} folders · ${formatBytes(feedback.stats.bytes)}`;
   panel.append(title, summary);
@@ -470,3 +530,4 @@ function toast(message: string, isError: boolean) {
 }
 
 void discover();
+window.setInterval(() => void runAutomaticSync(), AUTOMATIC_SYNC_INTERVAL_MS);

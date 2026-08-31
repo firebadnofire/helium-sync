@@ -14,6 +14,8 @@ helium-sync-client-core = { path = "../../helium-sync-client-core" }
 helium-sync-profile = { path = "../../helium-sync-profile" }
 secrecy.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+sysinfo.workspace = true
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 tokio.workspace = true
@@ -21,3 +23,11 @@ url.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+axum.workspace = true
+helium-sync-server = { path = "../../helium-sync-server" }
+http-body-util.workspace = true
+tempfile.workspace = true
+tower.workspace = true
