@@ -19,13 +19,21 @@ require_command() {
 find_llvm_tool() {
   local tool="$1"
   local candidate
+  local search_root
   if command -v "$tool" >/dev/null 2>&1; then
     command -v "$tool"
     return 0
   fi
-  candidate="$(find /usr/bin -maxdepth 1 \( -type f -o -type l \) -name "$tool-[0-9]*" -print 2>/dev/null | sort -V | tail -n 1)"
-  [[ -n "$candidate" ]] || return 1
-  printf '%s\n' "$candidate"
+  for search_root in /usr/bin /usr/lib/llvm-*/bin; do
+    [[ -d "$search_root" ]] || continue
+    candidate="$(find "$search_root" -maxdepth 1 \( -type f -o -type l \) \
+      \( -name "$tool" -o -name "$tool-[0-9]*" \) -print 2>/dev/null | sort -V | tail -n 1)"
+    if [[ -n "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
 }
 
 install_ubuntu_dependencies() {
