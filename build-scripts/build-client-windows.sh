@@ -41,10 +41,10 @@ install_ubuntu_dependencies() {
   printf 'Installing Ubuntu cross-compilation packages\n'
   if command -v sudo >/dev/null 2>&1; then
     sudo apt-get update
-    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential ca-certificates clang curl lld llvm libssl-dev pkg-config
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential ca-certificates clang clang-tools curl lld llvm libssl-dev pkg-config
   else
     apt-get update
-    DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential ca-certificates clang curl lld llvm libssl-dev pkg-config
+    DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential ca-certificates clang clang-tools curl lld llvm libssl-dev pkg-config
   fi
 }
 
@@ -70,7 +70,7 @@ fi
 
 mkdir -p "$shim_dir"
 for tool in clang-cl lld-link llvm-lib llvm-rc; do
-  tool_path="$(find_llvm_tool "$tool")" || fail "LLVM tool '$tool' is missing. Install Ubuntu packages clang, lld, and llvm."
+  tool_path="$(find_llvm_tool "$tool")" || fail "LLVM tool '$tool' is missing. Install Ubuntu packages clang, clang-tools, lld, and llvm."
   ln -sfn "$tool_path" "$shim_dir/$tool"
 done
 export PATH="$shim_dir:$PATH"
