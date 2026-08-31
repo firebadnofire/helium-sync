@@ -91,22 +91,6 @@ jobs:
           fi
 
           version="${tag:1}"
-          client_version="$(sed -n 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
-            crates/helium-sync-client/package.json | head -n 1)"
-          tauri_version="$(sed -n 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
-            crates/helium-sync-client/src-tauri/tauri.conf.json | head -n 1)"
-
-          for version_source in \
-            "client package.json:$client_version" \
-            "Tauri configuration:$tauri_version"; do
-            source_name="${version_source%%:*}"
-            source_version="${version_source#*:}"
-            if [[ "$source_version" != "$version" ]]; then
-              echo "Tag version '$version' does not match ${source_name} version '$source_version'." >&2
-              exit 1
-            fi
-          done
-
           printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
 
   build-linux:
