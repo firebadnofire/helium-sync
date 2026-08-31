@@ -63,6 +63,15 @@ jobs:
             echo "Forgejo server URL, repository, and commit SHA are required." >&2
             exit 1
           fi
+          if ! command -v git >/dev/null 2>&1; then
+            if command -v sudo >/dev/null 2>&1; then
+              sudo apt-get update
+              sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates git
+            else
+              apt-get update
+              DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates git
+            fi
+          fi
           git init .
           git remote remove origin 2>/dev/null || true
           git remote add origin "${server_url%/}/${repository}.git"
@@ -132,6 +141,15 @@ jobs:
           if [[ -z "$server_url" || -z "$repository" || -z "$sha" ]]; then
             echo "Forgejo server URL, repository, and commit SHA are required." >&2
             exit 1
+          fi
+          if ! command -v git >/dev/null 2>&1; then
+            if command -v sudo >/dev/null 2>&1; then
+              sudo apt-get update
+              sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates git
+            else
+              apt-get update
+              DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates git
+            fi
           fi
           git init .
           git remote remove origin 2>/dev/null || true
@@ -231,6 +249,15 @@ jobs:
             echo "Forgejo server URL, repository, and commit SHA are required." >&2
             exit 1
           fi
+          if ! command -v git >/dev/null 2>&1; then
+            if command -v sudo >/dev/null 2>&1; then
+              sudo apt-get update
+              sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates git
+            else
+              apt-get update
+              DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates git
+            fi
+          fi
           git init .
           git remote remove origin 2>/dev/null || true
           git remote add origin "${server_url%/}/${repository}.git"
@@ -312,6 +339,15 @@ jobs:
           if [[ -z "$server_url" || -z "$repository" || -z "$sha" ]]; then
             echo "Forgejo server URL, repository, and commit SHA are required." >&2
             exit 1
+          fi
+          if ! command -v git >/dev/null 2>&1; then
+            if command -v sudo >/dev/null 2>&1; then
+              sudo apt-get update
+              sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates git
+            else
+              apt-get update
+              DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates git
+            fi
           fi
           git init .
           git remote remove origin 2>/dev/null || true
