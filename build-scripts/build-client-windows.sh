@@ -30,10 +30,14 @@ find_llvm_tool() {
 
 install_ubuntu_dependencies() {
   [[ "${HELIUM_SYNC_INSTALL_DEPS:-0}" == "1" ]] || return 0
-  require_command sudo
   printf 'Installing Ubuntu cross-compilation packages\n'
-  sudo apt-get update
-  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential ca-certificates clang curl lld llvm libssl-dev pkg-config
+  if command -v sudo >/dev/null 2>&1; then
+    sudo apt-get update
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential ca-certificates clang curl lld llvm libssl-dev pkg-config
+  else
+    apt-get update
+    DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential ca-certificates clang curl lld llvm libssl-dev pkg-config
+  fi
 }
 
 [[ "$(uname -s)" == "Linux" ]] || fail "This script must run on an Ubuntu Linux runner."
