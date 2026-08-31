@@ -19,11 +19,12 @@ env:
     Assets:
     - Linux x86_64 server tarball: `helium-sync-server-linux-x86_64.tar.gz`
     - Linux x86_64 client tarball: `helium-sync-client-linux-x86_64.tar.gz`
-    - Windows x86_64 portable client: `helium-sync-client-windows-x86_64.zip`
+    - Windows x86_64 portable client: `helium-sync-client-windows-x86_64-portable.zip`
+    - Windows x86_64 NSIS installer: `helium-sync-client-windows-x86_64-installer.exe`
     - macOS universal client tarball: `helium-sync-client-macos-universal.tar.gz`
 
-    Every archive has a basename-only SHA-256 checksum in `<archive>.sha256`
-    and an armored detached signature in `<archive>.asc`.
+    Every listed artifact has a basename-only SHA-256 checksum in
+    `<artifact>.sha256` and an armored detached signature in `<artifact>.asc`.
 
     Recover the signing key using one of these methods:
 
@@ -180,6 +181,19 @@ jobs:
           tar -xJf "$RUNNER_TEMP/$node_archive" --strip-components=1 -C "$tool_root"
           printf '%s\n' "$tool_root/bin" >> "$GITHUB_PATH"
 
+      - name: Restore Linux build cache
+        uses: https://data.forgejo.org/actions/cache@v4
+        continue-on-error: true
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.npm
+            target
+          key: "helium-sync-linux-${{ runner.arch }}-${{ env.RUST_VERSION }}-${{ env.NODE_VERSION }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'crates/helium-sync-client/package-lock.json', 'crates/helium-sync-client/package.json', 'crates/helium-sync-client/src-tauri/tauri.conf.json') }}"
+          restore-keys: |
+            helium-sync-linux-${{ runner.arch }}-${{ env.RUST_VERSION }}-${{ env.NODE_VERSION }}-
+
       - name: Build and package Linux artifacts
         shell: bash
         env:
@@ -282,6 +296,19 @@ jobs:
           tar -xJf "$RUNNER_TEMP/$node_archive" --strip-components=1 -C "$tool_root"
           printf '%s\n' "$tool_root/bin" >> "$GITHUB_PATH"
 
+      - name: Restore Windows build cache
+        uses: https://data.forgejo.org/actions/cache@v4
+        continue-on-error: true
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.npm
+            target
+          key: "helium-sync-windows-${{ runner.arch }}-${{ env.RUST_VERSION }}-${{ env.NODE_VERSION }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'crates/helium-sync-client/package-lock.json', 'crates/helium-sync-client/package.json', 'crates/helium-sync-client/src-tauri/tauri.conf.json') }}"
+          restore-keys: |
+            helium-sync-windows-${{ runner.arch }}-${{ env.RUST_VERSION }}-${{ env.NODE_VERSION }}-
+
       - name: Cross-compile and package Windows client
         shell: bash
         env:
@@ -297,14 +324,28 @@ jobs:
           bash build-scripts/build-client-windows.sh
 
           package_root="${RUNNER_TEMP:?}/helium-sync-windows-package"
-          client_dir="$package_root/helium-sync-client-windows-x86_64"
-          mkdir -p dist/releases "$client_dir"
+          portable_dir="$package_root/helium-sync-client-windows-x86_64-portable"
+          installer_dir="target/x86_64-pc-windows-msvc/release/bundle/nsis"
+          mkdir -p dist/releases "$portable_dir"
           install -m 0755 target/x86_64-pc-windows-msvc/release/helium-sync-client.exe \
-            "$client_dir/helium-sync-client.exe"
-          install -m 0644 LICENSE README.md op-guide.md "$client_dir/"
-          (cd "$package_root"; zip -9 -r "$GITHUB_WORKSPACE/dist/releases/helium-sync-client-windows-x86_64.zip" \
-            helium-sync-client-windows-x86_64)
-          test -s dist/releases/helium-sync-client-windows-x86_64.zip
+            "$portable_dir/helium-sync-client.exe"
+          install -m 0644 LICENSE README.md op-guide.md "$portable_dir/"
+          (cd "$package_root"; zip -9 -r "$GITHUB_WORKSPACE/dist/releases/helium-sync-client-windows-x86_64-portable.zip" \
+            helium-sync-client-windows-x86_64-portable)
+
+          shopt -s nullglob
+          installers=("$installer_dir"/*-setup.exe)
+          shopt -u nullglob
+          if [[ "${#installers[@]}" -ne 1 ]]; then
+            echo "Expected exactly one NSIS installer in $installer_dir; found ${#installers[@]}." >&2
+            find "$installer_dir" -maxdepth 1 -type f -printf '%f\n' >&2 || true
+            exit 1
+          fi
+          install -m 0755 "${installers[0]}" \
+            dist/releases/helium-sync-client-windows-x86_64-installer.exe
+
+          test -s dist/releases/helium-sync-client-windows-x86_64-portable.zip
+          test -s dist/releases/helium-sync-client-windows-x86_64-installer.exe
 
       - name: Upload Windows release candidate
         uses: https://code.forgejo.org/forgejo/upload-artifact@v4
@@ -370,6 +411,19 @@ jobs:
           tar -xzf "$RUNNER_TEMP/$node_archive" --strip-components=1 -C "$tool_root"
           printf '%s\n' "$tool_root/bin" >> "$GITHUB_PATH"
 
+      - name: Restore macOS build cache
+        uses: https://data.forgejo.org/actions/cache@v4
+        continue-on-error: true
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.npm
+            target
+          key: "helium-sync-macos-${{ runner.arch }}-${{ env.RUST_VERSION }}-${{ env.NODE_VERSION }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'crates/helium-sync-client/package-lock.json', 'crates/helium-sync-client/package.json', 'crates/helium-sync-client/src-tauri/tauri.conf.json') }}"
+          restore-keys: |
+            helium-sync-macos-${{ runner.arch }}-${{ env.RUST_VERSION }}-${{ env.NODE_VERSION }}-
+
       - name: Build and package universal macOS client
         shell: bash
         env:
@@ -413,11 +467,11 @@ jobs:
           if command -v sudo >/dev/null 2>&1; then
             sudo apt-get update
             sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-              ca-certificates curl tar xz-utils
+            ca-certificates curl tar xz-utils
           else
             apt-get update
             DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-              ca-certificates curl tar xz-utils
+            ca-certificates curl tar xz-utils
           fi
 
           node_archive="node-v${NODE_VERSION}-linux-x64.tar.xz"
@@ -455,11 +509,11 @@ jobs:
           if command -v sudo >/dev/null 2>&1; then
             sudo apt-get update
             sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-              ca-certificates curl gnupg jq
+              ca-certificates curl git gnupg jq
           else
             apt-get update
             DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-              ca-certificates curl gnupg jq
+              ca-certificates curl git gnupg jq
           fi
 
       - name: Create and verify checksums and detached signatures
@@ -482,7 +536,8 @@ jobs:
           artifacts=(
             staging/helium-sync-server-linux-x86_64.tar.gz
             staging/helium-sync-client-linux-x86_64.tar.gz
-            staging/helium-sync-client-windows-x86_64.zip
+            staging/helium-sync-client-windows-x86_64-portable.zip
+            staging/helium-sync-client-windows-x86_64-installer.exe
             staging/helium-sync-client-macos-universal.tar.gz
           )
           for artifact in "${artifacts[@]}"; do
@@ -546,8 +601,8 @@ jobs:
           done
 
           file_count="$(find staging -maxdepth 1 -type f | wc -l)"
-          if [[ "$file_count" -ne 12 ]]; then
-            echo "Expected 12 release files (four artifacts, checksums, and signatures); found $file_count." >&2
+          if [[ "$file_count" -ne 15 ]]; then
+            echo "Expected 15 release files (five artifacts, checksums, and signatures); found $file_count." >&2
             find staging -maxdepth 1 -type f -printf '%f\n' >&2
             exit 1
           fi
@@ -651,4 +706,125 @@ jobs:
             api_request POST \
               "${api_url}/repos/${owner}/${repo}/releases/${release_id}/assets?name=${asset_name_encoded}" \
               --form "attachment=@${asset_path}" >/dev/null
+          done
+
+      - name: Mirror source and release to GitHub
+        shell: bash
+        env:
+          GH_KEY: ${{ secrets.GH_KEY }}
+          INPUT_RELEASE_BODY: ${{ env.RELEASE_BODY }}
+        run: |
+          set -Eeuo pipefail
+
+          github_repository="firebadnofire/helium-sync"
+          github_api_url="https://api.github.com"
+          github_git_url="https://github.com/${github_repository}.git"
+          tag="${FORGEJO_REF_NAME:-${GITHUB_REF_NAME:-}}"
+          source_server_url="${FORGEJO_SERVER_URL:-${GITHUB_SERVER_URL:-}}"
+          source_repository="${FORGEJO_REPOSITORY:-${GITHUB_REPOSITORY:-}}"
+
+          if [[ -z "${GH_KEY:-}" ]]; then
+            echo "Missing required secret GH_KEY for the GitHub mirror." >&2
+            exit 1
+          fi
+          if [[ -z "$tag" || -z "$source_server_url" || -z "$source_repository" ]]; then
+            echo "Source server, source repository, and release tag are required for the GitHub mirror." >&2
+            exit 1
+          fi
+
+          git init .
+          git remote remove forgejo-source 2>/dev/null || true
+          git remote add forgejo-source "${source_server_url%/}/${source_repository}.git"
+          git fetch --prune --no-tags forgejo-source '+refs/heads/*:refs/heads/*'
+          git fetch --prune forgejo-source '+refs/tags/*:refs/tags/*'
+
+          credential_file="$(mktemp "${RUNNER_TEMP%/}/helium-sync-github-credentials.XXXXXX")"
+          cleanup() { rm -f -- "$credential_file"; }
+          trap cleanup EXIT
+          chmod 600 "$credential_file"
+          printf 'https://x-access-token:%s@github.com\n' "$GH_KEY" > "$credential_file"
+
+          export GIT_TERMINAL_PROMPT=0
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0=credential.helper
+          export GIT_CONFIG_VALUE_0="store --file=$credential_file"
+          git remote remove github 2>/dev/null || true
+          git remote add github "$github_git_url"
+          git push --prune --force github '+refs/heads/*:refs/heads/*' '+refs/tags/*:refs/tags/*'
+
+          github_owner="${github_repository%%/*}"
+          github_repo="${github_repository#*/}"
+          tag_encoded="$(jq -nr --arg value "$tag" '$value|@uri')"
+          release_payload="$(jq -n \
+            --arg tag "$tag" \
+            --arg name "Helium Sync $tag" \
+            --arg body "$INPUT_RELEASE_BODY" \
+            '{tag_name: $tag, name: $name, body: $body, draft: false, prerelease: false}')"
+
+          github_api_request() {
+            local method="$1"
+            local url="$2"
+            shift 2
+            curl --proto '=https' --tlsv1.2 --fail-with-body --silent --show-error \
+              --request "$method" \
+              --header 'Accept: application/vnd.github+json' \
+              --header "Authorization: Bearer ${GH_KEY}" \
+              --header 'User-Agent: helium-sync-release-mirror' \
+              --header 'X-GitHub-Api-Version: 2022-11-28' \
+              "$@" \
+              "$url"
+          }
+
+          response_file="$(mktemp "${RUNNER_TEMP%/}/helium-sync-github-release.XXXXXX")"
+          status="$(curl --proto '=https' --tlsv1.2 --silent --show-error \
+            --output "$response_file" \
+            --write-out '%{http_code}' \
+            --header 'Accept: application/vnd.github+json' \
+            --header "Authorization: Bearer ${GH_KEY}" \
+            --header 'User-Agent: helium-sync-release-mirror' \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            "${github_api_url}/repos/${github_owner}/${github_repo}/releases/tags/${tag_encoded}")"
+          if [[ "$status" == 200 ]]; then
+            release_id="$(jq -r '.id' "$response_file")"
+            release_json="$(github_api_request PATCH "${github_api_url}/repos/${github_owner}/${github_repo}/releases/${release_id}" \
+              --header 'Content-Type: application/json' \
+              --data "$release_payload")"
+          elif [[ "$status" == 404 ]]; then
+            release_json="$(github_api_request POST "${github_api_url}/repos/${github_owner}/${github_repo}/releases" \
+              --header 'Content-Type: application/json' \
+              --data "$release_payload")"
+          else
+            cat "$response_file" >&2
+            rm -f -- "$response_file"
+            echo "Failed to look up GitHub release for $tag: HTTP $status" >&2
+            exit 1
+          fi
+          rm -f -- "$response_file"
+
+          release_id="$(printf '%s' "$release_json" | jq -r '.id')"
+          upload_url="$(printf '%s' "$release_json" | jq -r '.upload_url')"
+          if [[ -z "$release_id" || "$release_id" == null || -z "$upload_url" || "$upload_url" == null ]]; then
+            echo "GitHub release response did not contain an id and upload URL." >&2
+            exit 1
+          fi
+          upload_url="${upload_url%\{*}"
+
+          for asset_path in staging/*; do
+            if [[ ! -s "$asset_path" ]]; then
+              echo "Missing or empty release asset: $asset_path" >&2
+              exit 1
+            fi
+            asset_name="$(basename "$asset_path")"
+            asset_name_encoded="$(jq -nr --arg value "$asset_name" '$value|@uri')"
+            existing_asset_id="$(github_api_request GET "${github_api_url}/repos/${github_owner}/${github_repo}/releases/${release_id}/assets?per_page=100" \
+              | jq -r --arg name "$asset_name" '.[] | select(.name == $name) | .id' \
+              | head -n 1)"
+            if [[ -n "$existing_asset_id" ]]; then
+              github_api_request DELETE \
+                "${github_api_url}/repos/${github_owner}/${github_repo}/releases/assets/${existing_asset_id}" >/dev/null
+            fi
+            github_api_request POST \
+              "${upload_url}?name=${asset_name_encoded}" \
+              --header 'Content-Type: application/octet-stream' \
+              --data-binary "@${asset_path}" >/dev/null
           done

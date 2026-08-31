@@ -6,6 +6,7 @@ repo_root="$(cd -- "$script_dir/.." && pwd -P)"
 client_dir="$repo_root/crates/helium-sync-client"
 target="x86_64-pc-windows-msvc"
 shim_dir="$repo_root/target/build-tools/windows-llvm/bin"
+installer_dir="$repo_root/target/$target/release/bundle/nsis"
 
 fail() {
   printf 'ERROR: %s\n' "$*" >&2
@@ -41,10 +42,10 @@ install_ubuntu_dependencies() {
   printf 'Installing Ubuntu cross-compilation packages\n'
   if command -v sudo >/dev/null 2>&1; then
     sudo apt-get update
-    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential ca-certificates clang clang-tools curl lld llvm libssl-dev pkg-config
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential ca-certificates clang clang-tools curl lld llvm libssl-dev nsis pkg-config
   else
     apt-get update
-    DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential ca-certificates clang clang-tools curl lld llvm libssl-dev pkg-config
+    DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential ca-certificates clang clang-tools curl lld llvm libssl-dev nsis pkg-config
   fi
 }
 
@@ -87,9 +88,16 @@ printf 'Installing locked frontend dependencies\n'
 cd "$client_dir"
 npm ci
 
+mkdir -p "$installer_dir"
+find "$installer_dir" -maxdepth 1 -type f -name '*-setup.exe' -delete
 printf 'Cross-compiling Helium Sync client for %s\n' "$target"
-npm run tauri -- build --ci --no-bundle --runner cargo-xwin --target "$target"
+npm run tauri -- build --ci --bundles nsis --runner cargo-xwin --target "$target"
 
 artifact="$repo_root/target/$target/release/helium-sync-client.exe"
 [[ -f "$artifact" ]] || fail "Build completed without the expected executable: $artifact"
-printf 'Built %s\n' "$artifact"
+shopt -s nullglob
+installers=("$installer_dir"/*-setup.exe)
+shopt -u nullglob
+[[ "${#installers[@]}" -eq 1 ]] || fail "Build completed with ${#installers[@]} NSIS installers; expected exactly one in $installer_dir."
+printf 'Built portable executable %s\n' "$artifact"
+printf 'Built NSIS installer %s\n' "${installers[0]}"

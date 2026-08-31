@@ -609,10 +609,16 @@ The cross-build script supports Ubuntu runners only and uses `cargo-xwin`:
 HELIUM_SYNC_INSTALL_DEPS=1 bash build-scripts/build-client-windows.sh
 ```
 
-Artifact:
+Portable executable:
 
 ```text
 target/x86_64-pc-windows-msvc/release/helium-sync-client.exe
+```
+
+NSIS installer:
+
+```text
+target/x86_64-pc-windows-msvc/release/bundle/nsis/*-setup.exe
 ```
 
 Cross-building does not replace testing on a real Windows machine with
