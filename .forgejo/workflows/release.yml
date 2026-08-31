@@ -3,8 +3,8 @@ name: Release packaging
 'on':
   push:
     tags:
-      - 'v.*'
-      - 'V.*'
+      - 'v*'
+      - 'V*'
 
 permissions:
   contents: write
