@@ -1,0 +1,544 @@
+name: Release packaging
+
+'on':
+  push:
+    tags:
+      - 'v.*'
+      - 'V.*'
+
+permissions:
+  contents: write
+
+env:
+  NODE_VERSION: '24.18.0'
+  RUST_VERSION: '1.97.1'
+  RELEASE_SIGNING_FINGERPRINT: 7D6EF134D851C8DA0862D97494F31AF374E2EE3C
+  RELEASE_BODY: |
+    Automated release assets for Helium Sync.
+
+    Assets:
+    - Linux x86_64 server tarball: `helium-sync-server-linux-x86_64.tar.gz`
+    - Linux x86_64 client tarball: `helium-sync-client-linux-x86_64.tar.gz`
+    - Windows x86_64 portable client: `helium-sync-client-windows-x86_64.zip`
+    - macOS universal client tarball: `helium-sync-client-macos-universal.tar.gz`
+
+    Every archive has a basename-only SHA-256 checksum in `<archive>.sha256`
+    and an armored detached signature in `<archive>.asc`.
+
+    Recover the signing key using one of these methods:
+
+    ```sh
+    gpg --keyserver hkps://keys.openpgp.org --recv-keys 7D6EF134D851C8DA0862D97494F31AF374E2EE3C
+    # Or:
+    gpg --keyserver hkps://keyserver.ubuntu.com --recv-keys 7D6EF134D851C8DA0862D97494F31AF374E2EE3C
+    # Or:
+    curl --proto '=https' --tlsv1.2 -fsSLo william.asc https://archuser.org/gpg/william.asc
+    gpg --import william.asc
+
+    gpg --fingerprint 7D6EF134D851C8DA0862D97494F31AF374E2EE3C
+    sha256sum --check <artifact>.sha256
+    gpg --verify <artifact>.asc <artifact>
+    ```
+
+    Confirm the recovered key fingerprint is exactly
+    `7D6E F134 D851 C8DA 0862 D974 94F3 1AF3 74E2 EE3C` before trusting a
+    successful signature verification.
+
+jobs:
+  validate-tag:
+    name: Validate release tag
+    if: ${{ startsWith(forgejo.ref, 'refs/tags/v.') || startsWith(forgejo.ref, 'refs/tags/V.') || startsWith(github.ref, 'refs/tags/v.') || startsWith(github.ref, 'refs/tags/V.') }}
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Check out tagged source
+        uses: https://code.forgejo.org/actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Match the tag to workspace and client versions
+        id: version
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          tag="${FORGEJO_REF_NAME:-${GITHUB_REF_NAME:-}}"
+          if [[ ! "$tag" =~ ^[vV]\..+$ ]]; then
+            echo "Release tag must begin with v. or V.; received '${tag:-<empty>}'." >&2
+            exit 1
+          fi
+
+          version="${tag:2}"
+          workspace_version="$(awk '
+            /^\[workspace\.package\]$/ { in_workspace_package = 1; next }
+            /^\[/ { in_workspace_package = 0 }
+            in_workspace_package && /^version[[:space:]]*=/ {
+              value = $0
+              sub(/^[^=]*=[[:space:]]*"/, "", value)
+              sub(/"[[:space:]]*$/, "", value)
+              print value
+              exit
+            }
+          ' Cargo.toml)"
+          client_version="$(sed -n 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+            crates/helium-sync-client/package.json | head -n 1)"
+          tauri_version="$(sed -n 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+            crates/helium-sync-client/src-tauri/tauri.conf.json | head -n 1)"
+
+          if [[ -z "$workspace_version" ]]; then
+            echo "Could not read workspace.package.version from Cargo.toml." >&2
+            exit 1
+          fi
+
+          for version_source in \
+            "workspace Cargo.toml:$workspace_version" \
+            "client package.json:$client_version" \
+            "Tauri configuration:$tauri_version"; do
+            source_name="${version_source%%:*}"
+            source_version="${version_source#*:}"
+            if [[ "$source_version" != "$version" ]]; then
+              echo "Tag version '$version' does not match ${source_name} version '$source_version'." >&2
+              exit 1
+            fi
+          done
+
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+
+  build-linux:
+    name: Build Linux server and client
+    needs: validate-tag
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check out tagged source
+        uses: https://code.forgejo.org/actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential \
+            ca-certificates \
+            curl \
+            file \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            pkg-config \
+            tar \
+            xz-utils
+
+      - name: Install pinned Rust and Node toolchains
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          curl --proto '=https' --tlsv1.2 -fsS https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain "$RUST_VERSION"
+          cargo_bin="${CARGO_HOME:-${HOME:?}/.cargo}/bin"
+          printf '%s\n' "$cargo_bin" >> "$GITHUB_PATH"
+
+          node_archive="node-v${NODE_VERSION}-linux-x64.tar.xz"
+          node_url="https://nodejs.org/dist/v${NODE_VERSION}"
+          tool_root="${RUNNER_TEMP:?}/node-v${NODE_VERSION}"
+          mkdir -p "$tool_root"
+          curl --proto '=https' --tlsv1.2 -fsSLo "$RUNNER_TEMP/$node_archive" "$node_url/$node_archive"
+          curl --proto '=https' --tlsv1.2 -fsSLo "$RUNNER_TEMP/SHASUMS256.txt" "$node_url/SHASUMS256.txt"
+          (cd "$RUNNER_TEMP"; grep "  ${node_archive}$" SHASUMS256.txt | sha256sum --check --strict -)
+          tar -xJf "$RUNNER_TEMP/$node_archive" --strip-components=1 -C "$tool_root"
+          printf '%s\n' "$tool_root/bin" >> "$GITHUB_PATH"
+
+      - name: Build and package Linux artifacts
+        shell: bash
+        env:
+          HELIUM_SYNC_LINUX_TARGET: x86_64-unknown-linux-gnu
+        run: |
+          set -Eeuo pipefail
+
+          bash build-scripts/build-server-gnuLinux.sh
+          bash build-scripts/build-client-gnuLinux.sh
+
+          package_root="${RUNNER_TEMP:?}/helium-sync-linux-packages"
+          server_dir="$package_root/helium-sync-server-linux-x86_64"
+          client_dir="$package_root/helium-sync-client-linux-x86_64"
+          mkdir -p dist/releases "$server_dir" "$client_dir"
+
+          install -m 0755 target/x86_64-unknown-linux-gnu/release/helium-sync-server "$server_dir/helium-sync-server"
+          install -m 0644 LICENSE README.md op-guide.md config/server.example.toml "$server_dir/"
+          install -m 0644 contrib/systemd/helium-sync-server.service "$server_dir/helium-sync-server.service"
+
+          install -m 0755 target/x86_64-unknown-linux-gnu/release/helium-sync-client "$client_dir/helium-sync-client"
+          install -m 0644 LICENSE README.md op-guide.md "$client_dir/"
+
+          tar -C "$package_root" -czf dist/releases/helium-sync-server-linux-x86_64.tar.gz \
+            helium-sync-server-linux-x86_64
+          tar -C "$package_root" -czf dist/releases/helium-sync-client-linux-x86_64.tar.gz \
+            helium-sync-client-linux-x86_64
+          test -s dist/releases/helium-sync-server-linux-x86_64.tar.gz
+          test -s dist/releases/helium-sync-client-linux-x86_64.tar.gz
+
+      - name: Upload Linux release candidates
+        uses: https://code.forgejo.org/forgejo/upload-artifact@v4
+        with:
+          name: helium-sync-release-linux
+          path: dist/releases/*
+          if-no-files-found: error
+          retention-days: 7
+
+  build-windows:
+    name: Cross-compile Windows client on Ubuntu
+    needs: validate-tag
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check out tagged source
+        uses: https://code.forgejo.org/actions/checkout@v4
+
+      - name: Install Windows packaging prerequisites
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates curl xz-utils zip
+
+      - name: Install pinned Rust and Node toolchains
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          curl --proto '=https' --tlsv1.2 -fsS https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain "$RUST_VERSION"
+          cargo_bin="${CARGO_HOME:-${HOME:?}/.cargo}/bin"
+          printf '%s\n' "$cargo_bin" >> "$GITHUB_PATH"
+
+          node_archive="node-v${NODE_VERSION}-linux-x64.tar.xz"
+          node_url="https://nodejs.org/dist/v${NODE_VERSION}"
+          tool_root="${RUNNER_TEMP:?}/node-v${NODE_VERSION}"
+          mkdir -p "$tool_root"
+          curl --proto '=https' --tlsv1.2 -fsSLo "$RUNNER_TEMP/$node_archive" "$node_url/$node_archive"
+          curl --proto '=https' --tlsv1.2 -fsSLo "$RUNNER_TEMP/SHASUMS256.txt" "$node_url/SHASUMS256.txt"
+          (cd "$RUNNER_TEMP"; grep "  ${node_archive}$" SHASUMS256.txt | sha256sum --check --strict -)
+          tar -xJf "$RUNNER_TEMP/$node_archive" --strip-components=1 -C "$tool_root"
+          printf '%s\n' "$tool_root/bin" >> "$GITHUB_PATH"
+
+      - name: Cross-compile and package Windows client
+        shell: bash
+        env:
+          HELIUM_SYNC_INSTALL_DEPS: '1'
+        run: |
+          set -Eeuo pipefail
+
+          if [[ "$(. /etc/os-release; printf '%s' "${ID:-}")" != ubuntu ]]; then
+            echo "The Windows client may only be cross-compiled on an Ubuntu runner." >&2
+            exit 1
+          fi
+
+          bash build-scripts/build-client-windows.sh
+
+          package_root="${RUNNER_TEMP:?}/helium-sync-windows-package"
+          client_dir="$package_root/helium-sync-client-windows-x86_64"
+          mkdir -p dist/releases "$client_dir"
+          install -m 0755 target/x86_64-pc-windows-msvc/release/helium-sync-client.exe \
+            "$client_dir/helium-sync-client.exe"
+          install -m 0644 LICENSE README.md op-guide.md "$client_dir/"
+          (cd "$package_root"; zip -9 -r "$GITHUB_WORKSPACE/dist/releases/helium-sync-client-windows-x86_64.zip" \
+            helium-sync-client-windows-x86_64)
+          test -s dist/releases/helium-sync-client-windows-x86_64.zip
+
+      - name: Upload Windows release candidate
+        uses: https://code.forgejo.org/forgejo/upload-artifact@v4
+        with:
+          name: helium-sync-release-windows
+          path: dist/releases/*
+          if-no-files-found: error
+          retention-days: 7
+
+  build-macos:
+    name: Build universal macOS client
+    needs: validate-tag
+    runs-on: macos-latest
+    steps:
+      - name: Check out tagged source
+        uses: https://code.forgejo.org/actions/checkout@v4
+
+      - name: Install pinned Rust and Node toolchains
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          curl --proto '=https' --tlsv1.2 -fsS https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain "$RUST_VERSION"
+          cargo_bin="${CARGO_HOME:-${HOME:?}/.cargo}/bin"
+          printf '%s\n' "$cargo_bin" >> "$GITHUB_PATH"
+
+          case "$(uname -m)" in
+            arm64) node_arch=arm64 ;;
+            x86_64) node_arch=x64 ;;
+            *) echo "Unsupported macOS runner architecture: $(uname -m)" >&2; exit 1 ;;
+          esac
+          node_archive="node-v${NODE_VERSION}-darwin-${node_arch}.tar.gz"
+          node_url="https://nodejs.org/dist/v${NODE_VERSION}"
+          tool_root="${RUNNER_TEMP:?}/node-v${NODE_VERSION}"
+          mkdir -p "$tool_root"
+          curl --proto '=https' --tlsv1.2 -fsSLo "$RUNNER_TEMP/$node_archive" "$node_url/$node_archive"
+          curl --proto '=https' --tlsv1.2 -fsSLo "$RUNNER_TEMP/SHASUMS256.txt" "$node_url/SHASUMS256.txt"
+          (cd "$RUNNER_TEMP"; grep "  ${node_archive}$" SHASUMS256.txt | shasum -a 256 --check)
+          tar -xzf "$RUNNER_TEMP/$node_archive" --strip-components=1 -C "$tool_root"
+          printf '%s\n' "$tool_root/bin" >> "$GITHUB_PATH"
+
+      - name: Build and package universal macOS client
+        shell: bash
+        env:
+          HELIUM_SYNC_MAC_TARGET: universal-apple-darwin
+        run: |
+          set -Eeuo pipefail
+
+          bash build-scripts/build-client-mac.sh
+
+          package_root="${RUNNER_TEMP:?}/helium-sync-macos-package"
+          client_dir="$package_root/helium-sync-client-macos-universal"
+          mkdir -p dist/releases "$client_dir"
+          install -m 0755 target/universal-apple-darwin/release/helium-sync-client \
+            "$client_dir/helium-sync-client"
+          install -m 0644 LICENSE README.md op-guide.md "$client_dir/"
+          tar -C "$package_root" -czf dist/releases/helium-sync-client-macos-universal.tar.gz \
+            helium-sync-client-macos-universal
+          test -s dist/releases/helium-sync-client-macos-universal.tar.gz
+
+      - name: Upload macOS release candidate
+        uses: https://code.forgejo.org/forgejo/upload-artifact@v4
+        with:
+          name: helium-sync-release-macos
+          path: dist/releases/*
+          if-no-files-found: error
+          retention-days: 7
+
+  sign-and-publish:
+    name: Sign, verify, and publish release
+    needs:
+      - validate-tag
+      - build-linux
+      - build-windows
+      - build-macos
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Download Linux release candidates
+        uses: https://code.forgejo.org/forgejo/download-artifact@v4
+        with:
+          name: helium-sync-release-linux
+          path: staging
+
+      - name: Download Windows release candidate
+        uses: https://code.forgejo.org/forgejo/download-artifact@v4
+        with:
+          name: helium-sync-release-windows
+          path: staging
+
+      - name: Download macOS release candidate
+        uses: https://code.forgejo.org/forgejo/download-artifact@v4
+        with:
+          name: helium-sync-release-macos
+          path: staging
+
+      - name: Install publication tools
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates curl gnupg jq
+
+      - name: Create and verify checksums and detached signatures
+        shell: bash
+        env:
+          CI_KEY: ${{ secrets.CI_KEY }}
+          CI_KEY_PASSPHRASE: ${{ secrets.CI_KEY_PASSPHRASE }}
+        run: |
+          set -Eeuo pipefail
+
+          if [[ -z "${CI_KEY:-}" ]]; then
+            echo "Missing required secret CI_KEY (base64-encoded GPG private key)." >&2
+            exit 1
+          fi
+          if [[ -z "${CI_KEY_PASSPHRASE:-}" ]]; then
+            echo "Missing required secret CI_KEY_PASSPHRASE." >&2
+            exit 1
+          fi
+
+          artifacts=(
+            staging/helium-sync-server-linux-x86_64.tar.gz
+            staging/helium-sync-client-linux-x86_64.tar.gz
+            staging/helium-sync-client-windows-x86_64.zip
+            staging/helium-sync-client-macos-universal.tar.gz
+          )
+          for artifact in "${artifacts[@]}"; do
+            if [[ ! -s "$artifact" ]]; then
+              echo "Missing or empty release candidate: $artifact" >&2
+              exit 1
+            fi
+          done
+
+          signing_root="${RUNNER_TEMP:?}"
+          signing_home="$(mktemp -d "${signing_root%/}/helium-sync-gnupg.XXXXXX")"
+          case "$signing_home" in
+            "${signing_root%/}"/helium-sync-gnupg.*) ;;
+            *) echo "Refusing unexpected GPG home path: $signing_home" >&2; exit 1 ;;
+          esac
+          chmod 700 "$signing_home"
+          cleanup() { rm -rf -- "$signing_home"; }
+          trap cleanup EXIT
+
+          if ! printf '%s' "$CI_KEY" | base64 --decode | gpg --batch --homedir "$signing_home" --import; then
+            echo "CI_KEY is not valid base64 or does not contain an importable GPG private key." >&2
+            exit 1
+          fi
+
+          secret_key_count="$(gpg --batch --homedir "$signing_home" --with-colons --list-secret-keys \
+            | awk -F: '$1 == "sec" { count += 1 } END { print count + 0 }')"
+          if [[ "$secret_key_count" -ne 1 ]]; then
+            echo "CI_KEY must contain exactly one primary secret key; found $secret_key_count." >&2
+            exit 1
+          fi
+
+          signing_fingerprint="$(gpg --batch --homedir "$signing_home" --with-colons \
+            --fingerprint --list-secret-keys | awk -F: '$1 == "fpr" { print toupper($10); exit }')"
+          expected_fingerprint="$(printf '%s' "$RELEASE_SIGNING_FINGERPRINT" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')"
+          if [[ "$signing_fingerprint" != "$expected_fingerprint" ]]; then
+            echo "CI_KEY fingerprint does not match RELEASE_SIGNING_FINGERPRINT." >&2
+            echo "Expected: $expected_fingerprint" >&2
+            echo "Imported: ${signing_fingerprint:-<none>}" >&2
+            exit 1
+          fi
+
+          for artifact in "${artifacts[@]}"; do
+            artifact_dir="$(dirname "$artifact")"
+            artifact_name="$(basename "$artifact")"
+            (
+              cd "$artifact_dir"
+              sha256sum "$artifact_name" > "$artifact_name.sha256"
+              sha256sum --check --strict "$artifact_name.sha256"
+            )
+
+            printf '%s\n' "$CI_KEY_PASSPHRASE" \
+              | gpg --batch --yes --homedir "$signing_home" \
+                  --pinentry-mode loopback \
+                  --passphrase-fd 0 \
+                  --local-user "$signing_fingerprint" \
+                  --armor \
+                  --detach-sign \
+                  --output "$artifact.asc" \
+                  "$artifact"
+            gpg --batch --homedir "$signing_home" --verify "$artifact.asc" "$artifact"
+          done
+
+          file_count="$(find staging -maxdepth 1 -type f | wc -l)"
+          if [[ "$file_count" -ne 12 ]]; then
+            echo "Expected 12 release files (four artifacts, checksums, and signatures); found $file_count." >&2
+            find staging -maxdepth 1 -type f -printf '%f\n' >&2
+            exit 1
+          fi
+
+      - name: Retain signed release set
+        uses: https://code.forgejo.org/forgejo/upload-artifact@v4
+        with:
+          name: helium-sync-signed-release
+          path: staging/*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish Forgejo release
+        shell: bash
+        env:
+          FORGEJO_TOKEN: ${{ forgejo.token }}
+          INPUT_RELEASE_BODY: ${{ env.RELEASE_BODY }}
+        run: |
+          set -Eeuo pipefail
+
+          api_url="${FORGEJO_API_URL:-${GITHUB_API_URL:-}}"
+          repository="${FORGEJO_REPOSITORY:-${GITHUB_REPOSITORY:-}}"
+          tag="${FORGEJO_REF_NAME:-${GITHUB_REF_NAME:-}}"
+          token="${FORGEJO_TOKEN:-${GITHUB_TOKEN:-}}"
+          if [[ -z "$api_url" || -z "$repository" || -z "$tag" || -z "$token" ]]; then
+            echo "Forgejo API URL, repository, tag, and workflow token are required to publish." >&2
+            exit 1
+          fi
+          case "$api_url" in
+            https://*) ;;
+            *) echo "Forgejo API URL must use HTTPS: $api_url" >&2; exit 1 ;;
+          esac
+
+          owner="${repository%%/*}"
+          repo="${repository#*/}"
+          if [[ -z "$owner" || -z "$repo" || "$repo" == */* ]]; then
+            echo "Invalid Forgejo repository name: $repository" >&2
+            exit 1
+          fi
+
+          release_payload="$(jq -n \
+            --arg tag "$tag" \
+            --arg name "Helium Sync $tag" \
+            --arg body "$INPUT_RELEASE_BODY" \
+            '{tag_name: $tag, name: $name, body: $body, draft: false, prerelease: false, hide_archive_links: false}')"
+          tag_encoded="$(jq -nr --arg value "$tag" '$value|@uri')"
+
+          api_request() {
+            local method="$1"
+            local url="$2"
+            shift 2
+            curl --proto '=https' --tlsv1.2 --fail-with-body --silent --show-error \
+              --request "$method" \
+              --header "Authorization: token ${token}" \
+              "$@" \
+              "$url"
+          }
+
+          response_file="$(mktemp)"
+          status="$(curl --proto '=https' --tlsv1.2 --silent --show-error \
+            --output "$response_file" \
+            --write-out '%{http_code}' \
+            --header "Authorization: token ${token}" \
+            "${api_url}/repos/${owner}/${repo}/releases/tags/${tag_encoded}")"
+          if [[ "$status" == 200 ]]; then
+            release_id="$(jq -r '.id' "$response_file")"
+            release_json="$(api_request PATCH "${api_url}/repos/${owner}/${repo}/releases/${release_id}" \
+              --header 'Content-Type: application/json' \
+              --data "$release_payload")"
+          elif [[ "$status" == 404 ]]; then
+            release_json="$(api_request POST "${api_url}/repos/${owner}/${repo}/releases" \
+              --header 'Content-Type: application/json' \
+              --data "$release_payload")"
+          else
+            cat "$response_file" >&2
+            echo "Failed to look up Forgejo release for $tag: HTTP $status" >&2
+            exit 1
+          fi
+          rm -f -- "$response_file"
+
+          release_id="$(printf '%s' "$release_json" | jq -r '.id')"
+          if [[ -z "$release_id" || "$release_id" == null ]]; then
+            echo "Forgejo release response did not contain an id." >&2
+            exit 1
+          fi
+
+          for asset_path in staging/*; do
+            if [[ ! -s "$asset_path" ]]; then
+              echo "Missing or empty release asset: $asset_path" >&2
+              exit 1
+            fi
+            asset_name="$(basename "$asset_path")"
+            asset_name_encoded="$(jq -nr --arg value "$asset_name" '$value|@uri')"
+            existing_asset_id="$(api_request GET "${api_url}/repos/${owner}/${repo}/releases/${release_id}/assets" \
+              | jq -r --arg name "$asset_name" '.[] | select(.name == $name) | .id' \
+              | head -n 1)"
+            if [[ -n "$existing_asset_id" ]]; then
+              api_request DELETE \
+                "${api_url}/repos/${owner}/${repo}/releases/${release_id}/assets/${existing_asset_id}" >/dev/null
+            fi
+            api_request POST \
+              "${api_url}/repos/${owner}/${repo}/releases/${release_id}/assets?name=${asset_name_encoded}" \
+              --form "attachment=@${asset_path}" >/dev/null
+          done

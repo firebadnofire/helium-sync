@@ -31,7 +31,7 @@ pub enum ClientError {
     Ssh(String),
     #[error("remote Unix socket is unavailable: {0}")]
     RemoteSocket(String),
-    #[error("server authentication failed")]
+    #[error("Helium Sync API token was rejected; enter the token configured on the server exactly")]
     ApiAuthentication,
     #[error(
         "server protocol is incompatible (client {client_min}-{client_max}, server {server_min}-{server_max})"

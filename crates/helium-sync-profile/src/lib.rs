@@ -1,9 +1,11 @@
-//! Read-only Helium browser profile discovery and bookmark export.
+//! Helium browser profile discovery, bookmark export, and guarded restore.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs,
+    fs::{self, OpenOptions},
+    io::Write as _,
     path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
@@ -29,6 +31,18 @@ pub enum ProfileError {
     UnsupportedNodeType(String),
     #[error("temporary restore destination is not safe: {0}")]
     UnsafeRestore(PathBuf),
+    #[error("could not create backup archive {path}: {details}")]
+    Archive { path: PathBuf, details: String },
+    #[error("could not write restored bookmarks at {path}: {source}")]
+    Write {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("snapshot belongs to {snapshot_profile}, not selected profile {selected_profile}")]
+    ProfileMismatch {
+        snapshot_profile: String,
+        selected_profile: String,
+    },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -98,6 +112,19 @@ pub struct BookmarkSnapshotV1 {
 pub struct BookmarkRoot {
     pub key: String,
     pub node: BookmarkNode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BookmarkStats {
+    pub bookmarks: u64,
+    pub folders: u64,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RestoreResult {
+    pub backup_path: PathBuf,
+    pub stats: BookmarkStats,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -323,6 +350,203 @@ pub fn read_bookmarks(
     Err(ProfileError::Changing(path.to_path_buf()))
 }
 
+#[must_use]
+pub fn bookmark_stats(snapshot: &BookmarkSnapshotV1) -> BookmarkStats {
+    fn count(node: &BookmarkNode, bookmarks: &mut u64, folders: &mut u64) {
+        match node {
+            BookmarkNode::Folder { children, .. } => {
+                *folders += 1;
+                for child in children {
+                    count(child, bookmarks, folders);
+                }
+            }
+            BookmarkNode::Url { .. } => *bookmarks += 1,
+        }
+    }
+
+    let mut bookmarks = 0;
+    let mut folders = 0;
+    for root in &snapshot.roots {
+        count(&root.node, &mut bookmarks, &mut folders);
+    }
+    BookmarkStats {
+        bookmarks,
+        folders,
+        bytes: serde_json::to_vec(snapshot)
+            .map_or(0, |bytes| u64::try_from(bytes.len()).unwrap_or(u64::MAX)),
+    }
+}
+
+/// Restores a bookmark snapshot after archiving the current local file in `downloads_dir`.
+///
+/// The replacement is staged beside the live file. If moving the staged file into place fails,
+/// the original file is moved back before the error is returned.
+///
+/// # Errors
+///
+/// Returns an error before replacing local data if validation, backup creation, or staging fails.
+/// A replacement failure is returned after attempting to restore the original file.
+pub fn restore_bookmarks(
+    profile: &DiscoveredProfile,
+    snapshot: &BookmarkSnapshotV1,
+    downloads_dir: &Path,
+) -> Result<RestoreResult, ProfileError> {
+    if snapshot.profile_directory != profile.directory_name {
+        return Err(ProfileError::ProfileMismatch {
+            snapshot_profile: snapshot.profile_directory.clone(),
+            selected_profile: profile.directory_name.clone(),
+        });
+    }
+    let restored = chromium_bookmarks_json(snapshot).map_err(|source| ProfileError::Parse {
+        path: profile.bookmarks_path.clone(),
+        source,
+    })?;
+    fs::create_dir_all(downloads_dir).map_err(|source| ProfileError::Write {
+        path: downloads_dir.to_path_buf(),
+        source,
+    })?;
+    let unique = unique_suffix();
+    let safe_profile = profile
+        .directory_name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let backup_path = downloads_dir.join(format!(
+        "Helium-Sync-{safe_profile}-before-load-{unique}.zip"
+    ));
+    create_backup_archive(&backup_path, profile)?;
+
+    let staged_path = profile
+        .path
+        .join(format!(".Bookmarks.helium-sync-new-{unique}"));
+    let mut staged = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&staged_path)
+        .map_err(|source| ProfileError::Write {
+            path: staged_path.clone(),
+            source,
+        })?;
+    if let Err(source) = staged.write_all(&restored).and_then(|()| staged.sync_all()) {
+        drop(staged);
+        let _cleanup_result = fs::remove_file(&staged_path);
+        return Err(ProfileError::Write {
+            path: staged_path,
+            source,
+        });
+    }
+    drop(staged);
+
+    if profile.bookmarks_path.exists() {
+        let previous_path = profile
+            .path
+            .join(format!(".Bookmarks.helium-sync-previous-{unique}"));
+        fs::rename(&profile.bookmarks_path, &previous_path).map_err(|source| {
+            let _cleanup_result = fs::remove_file(&staged_path);
+            ProfileError::Write {
+                path: profile.bookmarks_path.clone(),
+                source,
+            }
+        })?;
+        if let Err(source) = fs::rename(&staged_path, &profile.bookmarks_path) {
+            let rollback = fs::rename(&previous_path, &profile.bookmarks_path);
+            let _cleanup_result = fs::remove_file(&staged_path);
+            return Err(ProfileError::Archive {
+                path: profile.bookmarks_path.clone(),
+                details: match rollback {
+                    Ok(()) => format!("replacement failed and the original was restored: {source}"),
+                    Err(rollback_error) => format!(
+                        "replacement failed ({source}); restoring the original also failed ({rollback_error}); backup: {}",
+                        backup_path.display()
+                    ),
+                },
+            });
+        }
+        fs::remove_file(&previous_path).map_err(|source| ProfileError::Write {
+            path: previous_path,
+            source,
+        })?;
+    } else {
+        fs::rename(&staged_path, &profile.bookmarks_path).map_err(|source| {
+            let _cleanup_result = fs::remove_file(&staged_path);
+            ProfileError::Write {
+                path: profile.bookmarks_path.clone(),
+                source,
+            }
+        })?;
+    }
+
+    Ok(RestoreResult {
+        backup_path,
+        stats: bookmark_stats(snapshot),
+    })
+}
+
+fn create_backup_archive(
+    backup_path: &Path,
+    profile: &DiscoveredProfile,
+) -> Result<(), ProfileError> {
+    let archive_file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(backup_path)
+        .map_err(|error| ProfileError::Archive {
+            path: backup_path.to_path_buf(),
+            details: error.to_string(),
+        })?;
+    let mut archive = zip::ZipWriter::new(archive_file);
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Zstd)
+        .unix_permissions(0o600);
+    let entry_name = format!("{}/Bookmarks", profile.directory_name.replace('\\', "_"));
+    let archive_result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        if profile.bookmarks_path.is_file() {
+            archive.start_file(entry_name, options)?;
+            let mut source = fs::File::open(&profile.bookmarks_path)?;
+            std::io::copy(&mut source, &mut archive)?;
+        } else {
+            archive.start_file("README.txt", options)?;
+            archive.write_all(b"No local Bookmarks file existed before this load.\n")?;
+        }
+        let completed = archive.finish()?;
+        completed.sync_all()?;
+        Ok(())
+    })();
+    if let Err(error) = archive_result {
+        let _cleanup_result = fs::remove_file(backup_path);
+        return Err(ProfileError::Archive {
+            path: backup_path.to_path_buf(),
+            details: error.to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn unique_suffix() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    format!("{nanos}-{}", std::process::id())
+}
+
+fn chromium_bookmarks_json(snapshot: &BookmarkSnapshotV1) -> Result<Vec<u8>, serde_json::Error> {
+    let roots = snapshot
+        .roots
+        .iter()
+        .map(|root| Ok((root.key.clone(), serde_json::to_value(&root.node)?)))
+        .collect::<Result<serde_json::Map<String, serde_json::Value>, serde_json::Error>>()?;
+    serde_json::to_vec_pretty(&serde_json::json!({
+        "version": snapshot.chromium_version,
+        "roots": roots,
+    }))
+}
+
 fn convert_node(raw: RawNode) -> Result<BookmarkNode, ProfileError> {
     match raw.kind.as_str() {
         "folder" => Ok(BookmarkNode::Folder {
@@ -379,7 +603,7 @@ pub fn write_test_bookmarks(
         return Err(ProfileError::UnsafeRestore(destination));
     }
     let output = destination.join("Bookmarks.restored.json");
-    let bytes = serde_json::to_vec_pretty(snapshot).map_err(|source| ProfileError::Parse {
+    let bytes = chromium_bookmarks_json(snapshot).map_err(|source| ProfileError::Parse {
         path: output.clone(),
         source,
     })?;
@@ -488,6 +712,7 @@ fn windows_registry_candidates() -> Vec<(PathBuf, PathBuf)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read as _;
 
     const BOOKMARKS: &str = r#"{
       "version": 1,
@@ -549,5 +774,50 @@ mod tests {
         };
         let output = write_test_bookmarks(&temp.path().join("restore"), &snapshot).unwrap();
         assert!(output.is_file());
+    }
+
+    #[test]
+    fn counts_and_restores_bookmarks_after_zip_backup() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile_path = temp.path().join("Default");
+        let downloads = temp.path().join("Downloads");
+        fs::create_dir(&profile_path).unwrap();
+        fs::write(profile_path.join("Bookmarks"), BOOKMARKS).unwrap();
+        let profile = DiscoveredProfile {
+            directory_name: "Default".to_owned(),
+            display_name: "Personal".to_owned(),
+            path: profile_path.clone(),
+            bookmarks_path: profile_path.join("Bookmarks"),
+            bookmark_status: BookmarkStatus::Readable,
+        };
+        let mut snapshot = read_bookmarks(&profile.bookmarks_path, "Default").unwrap();
+        if let BookmarkNode::Folder { children, .. } = &mut snapshot.roots[0].node {
+            children.push(BookmarkNode::Url {
+                id: "3".to_owned(),
+                name: "Second".to_owned(),
+                url: "https://example.org/".to_owned(),
+                date_added: None,
+            });
+        }
+
+        let result = restore_bookmarks(&profile, &snapshot, &downloads).unwrap();
+        assert_eq!(result.stats.bookmarks, 2);
+        assert_eq!(result.stats.folders, 1);
+        assert!(result.backup_path.is_file());
+        assert_eq!(
+            read_bookmarks(&profile.bookmarks_path, "Default").unwrap(),
+            snapshot
+        );
+
+        let archive_file = fs::File::open(result.backup_path).unwrap();
+        let mut archive = zip::ZipArchive::new(archive_file).unwrap();
+        let mut original = String::new();
+        let mut archived_bookmarks = archive.by_name("Default/Bookmarks").unwrap();
+        assert_eq!(
+            archived_bookmarks.compression(),
+            zip::CompressionMethod::Zstd
+        );
+        archived_bookmarks.read_to_string(&mut original).unwrap();
+        assert_eq!(original, BOOKMARKS);
     }
 }

@@ -1,4 +1,8 @@
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -114,14 +118,10 @@ impl client::Handler for Handler {
 #[async_trait]
 impl ApiTransport for SshTransport {
     async fn execute(&self, request: TransportRequest) -> Result<TransportResponse, ClientError> {
-        let key = load_secret_key(
+        let key = load_private_key(
             &self.config.private_key,
-            self.config
-                .private_key_passphrase
-                .as_ref()
-                .map(|value| value.expose_secret()),
-        )
-        .map_err(|error| ClientError::Ssh(format!("could not load SSH private key: {error}")))?;
+            self.config.private_key_passphrase.as_ref(),
+        )?;
         let ssh_config = Arc::new(client::Config {
             inactivity_timeout: Some(Duration::from_secs(30)),
             ..client::Config::default()
@@ -203,10 +203,61 @@ impl ApiTransport for SshTransport {
     }
 }
 
+/// Loads OpenSSH, PKCS#5/PKCS#8, and PuTTY PPK v2/v3 private keys through
+/// russh's format-aware decoder. PPK passphrases stay wrapped until decoding.
+fn load_private_key(
+    path: &Path,
+    passphrase: Option<&SecretString>,
+) -> Result<ssh_key::PrivateKey, ClientError> {
+    load_secret_key(path, passphrase.map(|value| value.expose_secret()))
+        .map_err(|error| ClientError::Ssh(format!("could not load SSH private key: {error}")))
+}
+
 fn map_handler_error(error: HandlerError) -> ClientError {
     match error {
         HandlerError::Unknown(fingerprint) => ClientError::SshHostKeyUnknown { fingerprint },
         HandlerError::Changed(message) => ClientError::SshHostKeyChanged(message),
         HandlerError::Protocol(error) => ClientError::Ssh(error.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("ssh")
+            .join(name)
+    }
+
+    #[test]
+    fn loads_unencrypted_putty_ppk_v3() {
+        let key = load_private_key(&fixture("ed25519-v3.ppk"), None).unwrap();
+        assert_eq!(key.algorithm(), ssh_key::Algorithm::Ed25519);
+    }
+
+    #[test]
+    fn loads_unencrypted_putty_ppk_v2() {
+        let key = load_private_key(&fixture("rsa-v2.ppk"), None).unwrap();
+        assert!(key.algorithm().is_rsa());
+    }
+
+    #[test]
+    fn loads_encrypted_putty_ppk_v3_with_passphrase() {
+        let passphrase = SecretString::from("123".to_owned());
+        let key =
+            load_private_key(&fixture("ed25519-v3-encrypted.ppk"), Some(&passphrase)).unwrap();
+        assert_eq!(key.algorithm(), ssh_key::Algorithm::Ed25519);
+    }
+
+    #[test]
+    fn rejects_encrypted_putty_ppk_with_wrong_passphrase() {
+        let passphrase = SecretString::from("wrong".to_owned());
+        let error =
+            load_private_key(&fixture("ed25519-v3-encrypted.ppk"), Some(&passphrase)).unwrap_err();
+        assert!(error.to_string().contains("could not load SSH private key"));
     }
 }

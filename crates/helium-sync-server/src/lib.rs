@@ -86,28 +86,42 @@ pub async fn serve(config: ServerConfig) -> Result<(), ServerError> {
         }
     }
 
+    // Bind and configure every listener before serving either one. In particular,
+    // a TCP port conflict must not leave a Unix-only process that still appears
+    // healthy to a service manager.
+    let tcp_listener = bind_tcp_listener(config.listen)?;
+    let tcp_server = axum_server::from_tcp_rustls(tcp_listener, tls_config)?;
+
     let unix_listener = tokio::net::UnixListener::bind(&config.unix_socket)?;
-    std::fs::set_permissions(
-        &config.unix_socket,
-        std::fs::Permissions::from_mode(config.unix_socket_mode),
-    )?;
-    if let Some(group_name) = &config.unix_socket_group {
-        let group = nix::unistd::Group::from_name(group_name)
-            .map_err(|error| {
+    let socket_setup = (|| -> Result<(), ServerError> {
+        std::fs::set_permissions(
+            &config.unix_socket,
+            std::fs::Permissions::from_mode(config.unix_socket_mode),
+        )?;
+        if let Some(group_name) = &config.unix_socket_group {
+            let group = nix::unistd::Group::from_name(group_name)
+                .map_err(|error| {
+                    ServerError::Config(config::ConfigError::Invalid(format!(
+                        "failed to resolve Unix socket group {group_name:?}: {error}"
+                    )))
+                })?
+                .ok_or_else(|| {
+                    ServerError::Config(config::ConfigError::Invalid(format!(
+                        "Unix socket group {group_name:?} does not exist"
+                    )))
+                })?;
+            nix::unistd::chown(&config.unix_socket, None, Some(group.gid)).map_err(|error| {
                 ServerError::Config(config::ConfigError::Invalid(format!(
-                    "failed to resolve Unix socket group {group_name:?}: {error}"
-                )))
-            })?
-            .ok_or_else(|| {
-                ServerError::Config(config::ConfigError::Invalid(format!(
-                    "Unix socket group {group_name:?} does not exist"
+                    "failed to set Unix socket group {group_name:?}: {error}"
                 )))
             })?;
-        nix::unistd::chown(&config.unix_socket, None, Some(group.gid)).map_err(|error| {
-            ServerError::Config(config::ConfigError::Invalid(format!(
-                "failed to set Unix socket group {group_name:?}: {error}"
-            )))
-        })?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = socket_setup {
+        drop(unix_listener);
+        let _ = remove_owned_socket(&config.unix_socket);
+        return Err(error);
     }
 
     let shared = router(state);
@@ -115,10 +129,9 @@ pub async fn serve(config: ServerConfig) -> Result<(), ServerError> {
     let handle = axum_server::Handle::new();
     let tcp_handle = handle.clone();
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
-    let listen = config.listen;
 
     let tcp = tokio::spawn(async move {
-        axum_server::bind_rustls(listen, tls_config)
+        tcp_server
             .handle(tcp_handle)
             .serve(https_router.into_make_service())
             .await
@@ -149,6 +162,15 @@ pub async fn serve(config: ServerConfig) -> Result<(), ServerError> {
 }
 
 #[cfg(target_os = "linux")]
+fn bind_tcp_listener(
+    address: std::net::SocketAddr,
+) -> Result<std::net::TcpListener, std::io::Error> {
+    let listener = std::net::TcpListener::bind(address)?;
+    listener.set_nonblocking(true)?;
+    Ok(listener)
+}
+
+#[cfg(target_os = "linux")]
 async fn shutdown_signal() -> Result<(), std::io::Error> {
     use tokio::signal::unix::{SignalKind, signal};
 
@@ -175,4 +197,60 @@ fn remove_owned_socket(path: &std::path::Path) -> Result<(), std::io::Error> {
 #[cfg(not(target_os = "linux"))]
 pub async fn serve(_config: ServerConfig) -> Result<(), ServerError> {
     Err(ServerError::UnsupportedPlatform)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use std::{fs, net::TcpListener, time::Duration};
+
+    use rcgen::{CertifiedKey, generate_simple_self_signed};
+    use secrecy::SecretString;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn occupied_tcp_port_fails_before_unix_socket_is_created() {
+        let temp = tempfile::tempdir().unwrap();
+        let tls_dir = temp.path().join("tls");
+        fs::create_dir(&tls_dir).unwrap();
+        let CertifiedKey { cert, signing_key } =
+            generate_simple_self_signed(["localhost".to_owned()]).unwrap();
+        let certificate = tls_dir.join("server.crt");
+        let private_key = tls_dir.join("server.key");
+        fs::write(&certificate, cert.pem()).unwrap();
+        fs::write(&private_key, signing_key.serialize_pem()).unwrap();
+
+        let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
+        let listen = occupied.local_addr().unwrap();
+        let unix_socket = temp.path().join("run/server.sock");
+        let config = ServerConfig {
+            listen,
+            unix_socket: unix_socket.clone(),
+            unix_socket_mode: 0o660,
+            unix_socket_group: None,
+            data_dir: temp.path().join("data"),
+            tls_certificate: certificate,
+            tls_private_key: private_key,
+            token: SecretString::from("0123456789abcdef0123456789abcdef".to_owned()),
+            database: temp.path().join("data/server.sqlite3"),
+            log_level: "info".to_owned(),
+        };
+
+        let error = tokio::time::timeout(Duration::from_secs(2), serve(config))
+            .await
+            .expect("port conflict must fail promptly")
+            .unwrap_err();
+        assert!(
+            matches!(error, ServerError::Io(ref source) if source.kind() == std::io::ErrorKind::AddrInUse),
+            "unexpected error: {error}"
+        );
+        assert!(!unix_socket.exists());
+    }
+
+    #[test]
+    fn prepared_tcp_listener_is_nonblocking() {
+        let listener = bind_tcp_listener("127.0.0.1:0".parse().unwrap()).unwrap();
+        let error = listener.accept().unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+    }
 }

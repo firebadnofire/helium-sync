@@ -14,7 +14,7 @@ use url::Url;
 
 #[tokio::test]
 #[ignore = "requires an explicitly configured live Helium Sync server"]
-async fn real_https_ssh_and_bookmark_round_trips() {
+async fn real_https_and_bookmark_round_trips() {
     let token = std::fs::read_to_string(required("HELIUM_SYNC_TEST_TOKEN_FILE"))
         .expect("read test token")
         .trim()
@@ -58,7 +58,15 @@ async fn real_https_ssh_and_bookmark_round_trips() {
         .await
         .expect("HTTPS bookmark round trip");
     assert!(bookmark_proof.plaintext_matches);
+}
 
+#[tokio::test]
+#[ignore = "requires an explicitly configured live Helium Sync server"]
+async fn real_ssh_round_trip() {
+    let token = std::fs::read_to_string(required("HELIUM_SYNC_TEST_TOKEN_FILE"))
+        .expect("read test token")
+        .trim()
+        .to_owned();
     let temp = tempfile::tempdir().expect("create temporary known-host directory");
     let ssh = SshTransport::new(SshConfig {
         host: required("HELIUM_SYNC_TEST_SSH_HOST"),

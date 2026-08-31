@@ -4,6 +4,8 @@ Helium Sync is an initial encrypted bookmark export proof for the Helium browser
 
 This release is deliberately not continuous synchronization and never writes retrieved data into a live Helium profile.
 
+> **New operator?** Start with the complete [download, build, deployment, client, backup, upgrade, and troubleshooting guide](op-guide.md).
+
 ## What is included
 
 - A Rust workspace with shared protocol, profile discovery, client core, Tauri 2 desktop client, and Linux server crates.
@@ -31,7 +33,7 @@ This release is deliberately not continuous synchronization and never writes ret
 | Package | Purpose |
 | --- | --- |
 | `helium-sync-common` | Versioned wire DTOs and validated IDs/timestamps/binary fields |
-| `helium-sync-profile` | Read-only Helium discovery and bookmark canonicalization |
+| `helium-sync-profile` | Helium discovery, bookmark canonicalization, and ZIP-backed guarded restore |
 | `helium-sync-client-core` | Transports, key storage, encryption, state, and workflows |
 | `helium-sync-client` | Thin Tauri 2 adapters and vanilla TypeScript UI |
 | `helium-sync-server` | Linux HTTPS/Unix-socket API and SQLite storage |

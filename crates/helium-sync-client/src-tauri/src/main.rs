@@ -1,16 +1,19 @@
 use std::{path::PathBuf, sync::Arc};
 
-use directories::ProjectDirs;
+use directories::{ProjectDirs, UserDirs};
 use helium_sync_client_core::{
     api::ApiClient,
     crypto::MasterKey,
     https::{CertificateMode, HttpsTransport, spki_sha256_from_pem},
-    orchestration::{ClientCore, SyncProof},
+    orchestration::{BOOKMARK_NAMESPACE, ClientCore},
     secrets::{NativeSecretStore, SecretStore as _},
     ssh::{SshConfig, SshTransport},
     state::LocalState,
 };
-use helium_sync_profile::{DiscoveryOptions, DiscoveryReport};
+use helium_sync_profile::{
+    BookmarkStats, BookmarkStatus, DiscoveredProfile, DiscoveryOptions, bookmark_stats,
+    restore_bookmarks,
+};
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::{Deserialize, Serialize};
 use tauri::State;
@@ -20,6 +23,8 @@ use url::Url;
 struct UiSession {
     core: Arc<ClientCore>,
     recovery_code: SecretString,
+    local: Arc<LocalState>,
+    server_id: String,
 }
 
 struct UiState {
@@ -69,10 +74,47 @@ struct DiagnosticReport {
     checks: Vec<DiagnosticCheck>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProfileView {
+    directory_name: String,
+    display_name: String,
+    browser_name: String,
+    bookmark_status: BookmarkStatus,
+    is_default: bool,
+    has_saved_copy: bool,
+    stats: Option<BookmarkStats>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProfileReport {
+    profiles: Vec<ProfileView>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SyncFeedback {
+    action: String,
+    profile_directory: String,
+    profile_name: String,
+    stats: BookmarkStats,
+    revision: u64,
+    backup_path: Option<PathBuf>,
+    message: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LoginResult {
+    diagnostics: DiagnosticReport,
+    sync: Option<SyncFeedback>,
+}
+
 #[tauri::command]
-fn discover_profiles() -> Result<DiscoveryReport, String> {
-    helium_sync_profile::discover(&DiscoveryOptions::from_environment())
-        .map_err(|error| error.to_string())
+async fn discover_profiles(state: State<'_, UiState>) -> Result<ProfileReport, String> {
+    let local = local_state(&state).await?;
+    profile_report(&state, &local).await
 }
 
 #[tauri::command]
@@ -84,7 +126,7 @@ fn inspect_certificate(path: PathBuf) -> Result<String, String> {
 async fn connect_https(
     input: HttpsInput,
     state: State<'_, UiState>,
-) -> Result<DiagnosticReport, String> {
+) -> Result<LoginResult, String> {
     let mut url_text = input.url.trim().to_owned();
     if !url_text.contains("://") {
         url_text = format!("https://{url_text}");
@@ -130,10 +172,7 @@ async fn connect_https(
 }
 
 #[tauri::command]
-async fn connect_ssh(
-    input: SshInput,
-    state: State<'_, UiState>,
-) -> Result<DiagnosticReport, String> {
+async fn connect_ssh(input: SshInput, state: State<'_, UiState>) -> Result<LoginResult, String> {
     if let Some(passphrase) = &input.private_key_passphrase
         && !passphrase.is_empty()
     {
@@ -180,7 +219,7 @@ async fn connect(
     state: &State<'_, UiState>,
     transport_name: &str,
     endpoint: &str,
-) -> Result<DiagnosticReport, String> {
+) -> Result<LoginResult, String> {
     if api_token.len() < 32 {
         return Err("API token must contain at least 32 characters".to_owned());
     }
@@ -189,9 +228,7 @@ async fn connect(
         .set("api-token", &SecretString::from(api_token.clone()))
         .map_err(|error| error.to_string())?;
     let (master_key, recovery_code) = load_or_create_master_key(&state.secrets)?;
-    let local = LocalState::open(&state.data_dir.join("client.sqlite3"))
-        .await
-        .map_err(|error| error.to_string())?;
+    let local = Arc::new(local_state(state).await?);
     local
         .save_connection(endpoint, &transport_name.to_ascii_lowercase(), endpoint)
         .await
@@ -204,70 +241,98 @@ async fn connect(
     core.register_device(device_name.trim())
         .await
         .map_err(|error| error.to_string())?;
+    let forced_sync = forced_default_sync(&local, &core, endpoint).await?;
     *state.session.lock().await = Some(UiSession {
         core,
         recovery_code,
+        local,
+        server_id: endpoint.to_owned(),
     });
-    Ok(DiagnosticReport {
-        checks: vec![
-            check(
-                format!("{transport_name} connection"),
-                format!("{transport_name} transport connected"),
-                "Certificate or host-key verification succeeded.".to_owned(),
-            ),
-            check(
-                "API authentication".to_owned(),
-                "Bearer token accepted".to_owned(),
-                "The token was sent only in the authenticated transport.".to_owned(),
-            ),
-            check(
-                "Protocol".to_owned(),
-                format!("Protocol {} compatible", status.protocol.0),
-                format!(
-                    "Server {} supports {}-{} with capabilities: {}",
-                    version.server_version,
-                    version.protocol.min.0,
-                    version.protocol.max.0,
-                    version.capabilities.join(", ")
+    Ok(LoginResult {
+        sync: forced_sync,
+        diagnostics: DiagnosticReport {
+            checks: vec![
+                check(
+                    format!("{transport_name} connection"),
+                    format!("{transport_name} transport connected"),
+                    "Certificate or host-key verification succeeded.".to_owned(),
                 ),
-            ),
-            check(
-                "Database".to_owned(),
-                "Server health is OK".to_owned(),
-                format!(
-                    "Server status: {}; database: {}",
-                    status.status, status.database
+                check(
+                    "API authentication".to_owned(),
+                    "Bearer token accepted".to_owned(),
+                    "The token was sent only in the authenticated transport.".to_owned(),
                 ),
-            ),
-        ],
+                check(
+                    "Protocol".to_owned(),
+                    format!("Protocol {} compatible", status.protocol.0),
+                    format!(
+                        "Server {} supports {}-{} with capabilities: {}",
+                        version.server_version,
+                        version.protocol.min.0,
+                        version.protocol.max.0,
+                        version.capabilities.join(", ")
+                    ),
+                ),
+                check(
+                    "Database".to_owned(),
+                    "Server health is OK".to_owned(),
+                    format!(
+                        "Server status: {}; database: {}",
+                        status.status, status.database
+                    ),
+                ),
+            ],
+        },
     })
 }
 
 #[tauri::command]
-async fn run_synthetic(state: State<'_, UiState>) -> Result<SyncProof, String> {
-    let core = session_core(&state).await?;
-    core.synthetic_round_trip()
+async fn rename_profile(
+    profile_directory: String,
+    display_name: String,
+    state: State<'_, UiState>,
+) -> Result<ProfileReport, String> {
+    let local = local_state(&state).await?;
+    ensure_discovered_profiles(&local).await?;
+    local
+        .rename_profile(&profile_directory, &display_name)
         .await
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    profile_report(&state, &local).await
 }
 
 #[tauri::command]
-async fn run_bookmarks(
+async fn set_default_profile(
     profile_directory: String,
     state: State<'_, UiState>,
-) -> Result<SyncProof, String> {
-    let report = helium_sync_profile::discover(&DiscoveryOptions::from_environment())
-        .map_err(|error| error.to_string())?;
-    let profile = report
-        .profiles
-        .iter()
-        .find(|profile| profile.directory_name == profile_directory)
-        .ok_or_else(|| "Selected Helium profile is no longer available".to_owned())?;
-    let core = session_core(&state).await?;
-    core.bookmark_round_trip(profile)
+) -> Result<ProfileReport, String> {
+    let local = local_state(&state).await?;
+    ensure_discovered_profiles(&local).await?;
+    local
+        .set_default_profile(&profile_directory)
         .await
-        .map(|(proof, _)| proof)
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    profile_report(&state, &local).await
+}
+
+#[tauri::command]
+async fn save_profile(
+    profile_directory: String,
+    state: State<'_, UiState>,
+) -> Result<SyncFeedback, String> {
+    let profile = discovered_profile(&profile_directory)?;
+    let (core, local, server_id) = session_context(&state).await?;
+    save_profile_to_server(&core, &local, &server_id, &profile).await
+}
+
+#[tauri::command]
+async fn load_profile(
+    profile_directory: String,
+    state: State<'_, UiState>,
+) -> Result<SyncFeedback, String> {
+    let profile = discovered_profile(&profile_directory)?;
+    let (core, local, server_id) = session_context(&state).await?;
+    load_profile_from_server(&core, &local, &server_id, &profile).await
 }
 
 #[tauri::command]
@@ -295,14 +360,263 @@ async fn import_recovery_code(
     Ok(())
 }
 
-async fn session_core(state: &State<'_, UiState>) -> Result<Arc<ClientCore>, String> {
+async fn local_state(state: &State<'_, UiState>) -> Result<LocalState, String> {
+    LocalState::open(&state.data_dir.join("client.sqlite3"))
+        .await
+        .map_err(|error| error.to_string())
+}
+
+async fn ensure_discovered_profiles(local: &LocalState) -> Result<Vec<DiscoveredProfile>, String> {
+    let report = helium_sync_profile::discover(&DiscoveryOptions::from_environment())
+        .map_err(|error| error.to_string())?;
+    for profile in &report.profiles {
+        local
+            .ensure_profile(&profile.directory_name, &profile.display_name)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    let preferences = local
+        .profile_preferences()
+        .await
+        .map_err(|error| error.to_string())?;
+    let current_default_is_present = preferences.iter().any(|preference| {
+        preference.is_default
+            && report
+                .profiles
+                .iter()
+                .any(|profile| profile.directory_name == preference.directory_name)
+    });
+    if !current_default_is_present
+        && let Some(profile) = report
+            .profiles
+            .iter()
+            .find(|profile| profile.directory_name == "Default")
+            .or_else(|| report.profiles.first())
+    {
+        local
+            .set_default_profile(&profile.directory_name)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(report.profiles)
+}
+
+async fn profile_report(
+    state: &State<'_, UiState>,
+    local: &LocalState,
+) -> Result<ProfileReport, String> {
+    let profiles = ensure_discovered_profiles(local).await?;
+    let preferences = local
+        .profile_preferences()
+        .await
+        .map_err(|error| error.to_string())?;
+    let connected_server = state
+        .session
+        .lock()
+        .await
+        .as_ref()
+        .map(|session| session.server_id.clone());
+    let mut views = Vec::with_capacity(profiles.len());
+    for profile in profiles {
+        let preference = preferences
+            .iter()
+            .find(|preference| preference.directory_name == profile.directory_name);
+        let has_saved_copy = if let Some(server_id) = &connected_server {
+            local
+                .mapping(server_id, BOOKMARK_NAMESPACE, &profile.directory_name)
+                .await
+                .map_err(|error| error.to_string())?
+                .is_some()
+        } else {
+            false
+        };
+        let stats = if profile.bookmark_status == BookmarkStatus::Readable {
+            helium_sync_profile::read_bookmarks(&profile.bookmarks_path, &profile.directory_name)
+                .ok()
+                .map(|snapshot| bookmark_stats(&snapshot))
+        } else {
+            None
+        };
+        views.push(ProfileView {
+            directory_name: profile.directory_name,
+            display_name: preference.map_or_else(
+                || profile.display_name.clone(),
+                |value| value.display_name.clone(),
+            ),
+            browser_name: profile.display_name,
+            bookmark_status: profile.bookmark_status,
+            is_default: preference.is_some_and(|value| value.is_default),
+            has_saved_copy,
+            stats,
+        });
+    }
+    Ok(ProfileReport { profiles: views })
+}
+
+fn discovered_profile(profile_directory: &str) -> Result<DiscoveredProfile, String> {
+    helium_sync_profile::discover(&DiscoveryOptions::from_environment())
+        .map_err(|error| error.to_string())?
+        .profiles
+        .into_iter()
+        .find(|profile| profile.directory_name == profile_directory)
+        .ok_or_else(|| "Selected Helium profile is no longer available".to_owned())
+}
+
+async fn session_context(
+    state: &State<'_, UiState>,
+) -> Result<(Arc<ClientCore>, Arc<LocalState>, String), String> {
     state
         .session
         .lock()
         .await
         .as_ref()
-        .map(|session| Arc::clone(&session.core))
-        .ok_or_else(|| "Connect to a server first".to_owned())
+        .map(|session| {
+            (
+                Arc::clone(&session.core),
+                Arc::clone(&session.local),
+                session.server_id.clone(),
+            )
+        })
+        .ok_or_else(|| "Sign in to a server first".to_owned())
+}
+
+async fn profile_name(local: &LocalState, profile: &DiscoveredProfile) -> Result<String, String> {
+    Ok(local
+        .profile_preferences()
+        .await
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|preference| preference.directory_name == profile.directory_name)
+        .map_or_else(|| profile.display_name.clone(), |value| value.display_name))
+}
+
+async fn save_profile_to_server(
+    core: &ClientCore,
+    local: &LocalState,
+    server_id: &str,
+    profile: &DiscoveredProfile,
+) -> Result<SyncFeedback, String> {
+    let mapping = local
+        .mapping(server_id, BOOKMARK_NAMESPACE, &profile.directory_name)
+        .await
+        .map_err(|error| error.to_string())?;
+    let (proof, snapshot) = core
+        .save_bookmarks(
+            profile,
+            mapping.as_ref().map(|value| value.object_id),
+            mapping.as_ref().map(|value| value.revision),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    local
+        .save_mapping(
+            server_id,
+            BOOKMARK_NAMESPACE,
+            &profile.directory_name,
+            proof.object_id,
+            proof.revision,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let stats = bookmark_stats(&snapshot);
+    Ok(SyncFeedback {
+        action: "saved".to_owned(),
+        profile_directory: profile.directory_name.clone(),
+        profile_name: profile_name(local, profile).await?,
+        message: format!(
+            "Saved {} bookmarks in {} folders.",
+            stats.bookmarks, stats.folders
+        ),
+        stats,
+        revision: proof.revision,
+        backup_path: None,
+    })
+}
+
+async fn load_profile_from_server(
+    core: &ClientCore,
+    local: &LocalState,
+    server_id: &str,
+    profile: &DiscoveredProfile,
+) -> Result<SyncFeedback, String> {
+    let mapping = local
+        .mapping(server_id, BOOKMARK_NAMESPACE, &profile.directory_name)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| {
+            "This profile has no saved server copy. Save it before loading.".to_owned()
+        })?;
+    let (snapshot, proof) = core
+        .load_bookmarks(mapping.object_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let user_dirs = UserDirs::new()
+        .ok_or_else(|| "The operating system did not provide a user home directory".to_owned())?;
+    let downloads = user_dirs
+        .download_dir()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| user_dirs.home_dir().join("Downloads"));
+    let restored =
+        restore_bookmarks(profile, &snapshot, &downloads).map_err(|error| error.to_string())?;
+    local
+        .save_mapping(
+            server_id,
+            BOOKMARK_NAMESPACE,
+            &profile.directory_name,
+            proof.object_id,
+            proof.revision,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(SyncFeedback {
+        action: "loaded".to_owned(),
+        profile_directory: profile.directory_name.clone(),
+        profile_name: profile_name(local, profile).await?,
+        message: format!(
+            "Loaded {} bookmarks. The previous local file is backed up in Downloads.",
+            restored.stats.bookmarks
+        ),
+        stats: restored.stats,
+        revision: proof.revision,
+        backup_path: Some(restored.backup_path),
+    })
+}
+
+async fn forced_default_sync(
+    local: &LocalState,
+    core: &ClientCore,
+    server_id: &str,
+) -> Result<Option<SyncFeedback>, String> {
+    let profiles = ensure_discovered_profiles(local).await?;
+    let Some(default) = local
+        .default_profile()
+        .await
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(None);
+    };
+    let Some(profile) = profiles
+        .iter()
+        .find(|profile| profile.directory_name == default.directory_name)
+    else {
+        return Ok(None);
+    };
+    if local
+        .mapping(server_id, BOOKMARK_NAMESPACE, &profile.directory_name)
+        .await
+        .map_err(|error| error.to_string())?
+        .is_some()
+    {
+        load_profile_from_server(core, local, server_id, profile)
+            .await
+            .map(Some)
+    } else if profile.bookmark_status == BookmarkStatus::Readable {
+        save_profile_to_server(core, local, server_id, profile)
+            .await
+            .map(Some)
+    } else {
+        Err("The default profile is not readable, so login sync could not complete".to_owned())
+    }
 }
 
 fn load_or_create_master_key(
@@ -349,8 +663,10 @@ fn main() {
             inspect_certificate,
             connect_https,
             connect_ssh,
-            run_synthetic,
-            run_bookmarks,
+            rename_profile,
+            set_default_profile,
+            save_profile,
+            load_profile,
             reveal_recovery_code,
             import_recovery_code,
         ])

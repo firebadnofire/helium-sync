@@ -3,64 +3,75 @@ import { open } from "@tauri-apps/plugin-dialog";
 import "./style.css";
 
 type BookmarkStatus = "missing" | "readable" | { invalid: string };
+type BookmarkStats = { bookmarks: number; folders: number; bytes: number };
 type Profile = {
-  directory_name: string;
-  display_name: string;
-  path: string;
-  bookmarks_path: string;
-  bookmark_status: BookmarkStatus;
+  directoryName: string;
+  displayName: string;
+  browserName: string;
+  bookmarkStatus: BookmarkStatus;
+  isDefault: boolean;
+  hasSavedCopy: boolean;
+  stats: BookmarkStats | null;
 };
-type DiscoveryReport = {
-  installation: { executable: string | null; user_data_dir: string; source: string };
-  profiles: Profile[];
-};
-type DiagnosticCheck = {
-  name: string;
-  ok: boolean;
-  summary: string;
-  details: string;
-};
+type ProfileReport = { profiles: Profile[] };
+type DiagnosticCheck = { name: string; ok: boolean; summary: string; details: string };
 type DiagnosticReport = { checks: DiagnosticCheck[] };
-type SyncProof = {
-  object_id: string;
-  namespace: string;
+type SyncFeedback = {
+  action: "saved" | "loaded";
+  profileDirectory: string;
+  profileName: string;
+  stats: BookmarkStats;
   revision: number;
-  cursor: number;
-  plaintext_matches: boolean;
+  backupPath: string | null;
+  message: string;
 };
+type LoginResult = { diagnostics: DiagnosticReport; sync: SyncFeedback | null };
 
 const app = document.querySelector<HTMLDivElement>("#app")!;
 app.innerHTML = `
   <header>
     <div>
-      <p class="eyebrow">SELF-HOSTED PROFILE SYNC</p>
+      <p class="eyebrow">PRIVATE BOOKMARK SYNC</p>
       <h1>Helium Sync</h1>
-      <p class="subtitle">Encrypted bookmark export through your server. Live browser data remains read-only.</p>
+      <p class="subtitle">Save and restore encrypted Helium bookmark profiles through your server.</p>
     </div>
-    <span id="connection-badge" class="badge idle">Not connected</span>
+    <span id="connection-badge" class="badge idle">Signed out</span>
   </header>
 
   <nav aria-label="Application sections">
-    <button class="tab active" data-tab="connection">Server connection</button>
-    <button class="tab" data-tab="profiles">Profiles</button>
-    <button class="tab" data-tab="diagnostics">Diagnostics</button>
+    <button class="tab active" data-tab="profiles">Profiles</button>
+    <button class="tab" data-tab="connection">Connection</button>
   </nav>
 
   <main>
-    <section id="connection" class="panel active">
+    <section id="profiles" class="panel active">
       <div class="section-heading">
-        <div><p class="eyebrow">TRANSPORT</p><h2>Connect securely</h2></div>
+        <div><p class="eyebrow">LOCAL HELIUM</p><h2>Profiles</h2></div>
+        <button id="refresh-profiles" type="button">Refresh</button>
+      </div>
+      <p class="muted profile-intro">Select a profile to manage it. The default profile is synchronized automatically when you sign in.</p>
+      <div id="profile-list" class="profile-list" aria-live="polite"></div>
+      <section id="sync-feedback" class="feedback hidden" aria-live="polite"></section>
+    </section>
+
+    <section id="connection" class="panel">
+      <div class="section-heading">
+        <div><p class="eyebrow">SERVER</p><h2>Sign in securely</h2></div>
         <div class="segmented" role="group" aria-label="Transport mode">
-          <button id="mode-https" class="active">HTTPS</button>
-          <button id="mode-ssh">SSH</button>
+          <button id="mode-https" class="active" type="button">HTTPS</button>
+          <button id="mode-ssh" type="button">SSH</button>
         </div>
       </div>
+      <aside class="login-note">
+        <strong>Sign in also syncs your default profile.</strong>
+        <span>The first sign-in saves it. Later sign-ins load the server copy after backing up the local Bookmarks file to Downloads.</span>
+      </aside>
 
       <form id="https-form" class="form-grid">
         <label class="wide">Hostname or URL<input id="https-url" value="https://localhost" required /></label>
         <label>Port<input id="https-port" type="number" min="1" max="65535" value="7500" required /></label>
         <label class="wide">API token<input id="https-token" type="password" autocomplete="off" minlength="32" required /></label>
-        <label>Certificate mode
+        <label>Certificate verification
           <select id="certificate-mode">
             <option value="system">System trust</option>
             <option value="custom_ca">Custom CA</option>
@@ -74,45 +85,33 @@ app.innerHTML = `
           <div class="input-action"><input id="spki-pin" placeholder="sha256/..." /><button type="button" id="calculate-pin">Read certificate</button></div>
         </label>
         <label class="wide">Device name<input id="https-device" value="My Helium device" maxlength="128" required /></label>
-        <div class="wide form-actions"><button class="primary" type="submit">Connect with HTTPS</button></div>
+        <div class="wide form-actions"><button class="primary" type="submit">Sign in and sync</button></div>
       </form>
 
       <form id="ssh-form" class="form-grid hidden">
         <label class="wide">SSH host<input id="ssh-host" required /></label>
         <label>SSH port<input id="ssh-port" type="number" min="1" max="65535" value="22" required /></label>
         <label>Username<input id="ssh-username" autocomplete="username" required /></label>
-        <label class="wide">Private key
+        <label class="wide">Private key (OpenSSH, PEM, or PuTTY .ppk)
           <div class="input-action"><input id="ssh-key" required /><button type="button" id="browse-key">Browse</button></div>
         </label>
         <label class="wide">Private-key passphrase (optional)<input id="ssh-passphrase" type="password" autocomplete="off" /></label>
         <label class="wide">Remote socket<input id="ssh-socket" value="/run/helium-sync/server.sock" required /></label>
         <label class="wide">Helium Sync API token<input id="ssh-token" type="password" autocomplete="off" minlength="32" required /></label>
-        <label class="wide">Confirmed host-key fingerprint (only after verification)<input id="ssh-fingerprint" placeholder="SHA256:..." /></label>
+        <label class="wide">Confirmed host-key fingerprint<input id="ssh-fingerprint" placeholder="SHA256:..." /></label>
         <label class="wide">Device name<input id="ssh-device" value="My Helium device" maxlength="128" required /></label>
-        <div class="wide form-actions"><button class="primary" type="submit">Connect through SSH</button></div>
+        <div class="wide form-actions"><button class="primary" type="submit">Sign in and sync</button></div>
       </form>
 
-      <aside class="security-note"><strong>Fail-closed security</strong><span>There is no option to ignore certificate or SSH host-key errors. API tokens and sync keys are stored in the operating system credential store.</span></aside>
-      <div class="recovery">
-        <button id="reveal-recovery" type="button">Reveal recovery code</button>
-        <div class="input-action"><input id="import-code" type="password" placeholder="hsync1: recovery code" /><button id="import-recovery" type="button">Import</button></div>
-      </div>
-    </section>
-
-    <section id="profiles" class="panel">
-      <div class="section-heading"><div><p class="eyebrow">LOCAL BROWSER</p><h2>Discovered profiles</h2></div><button id="refresh-profiles">Refresh</button></div>
-      <p id="installation-summary" class="muted">Discovery has not run yet.</p>
-      <div id="profile-list" class="cards"></div>
-      <div class="proof-actions">
-        <button id="run-synthetic" class="primary" disabled>Run synthetic encrypted round trip</button>
-        <button id="run-bookmarks" disabled>Export and verify selected bookmarks</button>
-      </div>
-      <pre id="proof-result" class="result hidden"></pre>
-    </section>
-
-    <section id="diagnostics" class="panel">
-      <div class="section-heading"><div><p class="eyebrow">CONNECTION HEALTH</p><h2>Diagnostics</h2></div></div>
-      <div id="diagnostic-list" class="diagnostics"><p class="muted">Connect to a server to run diagnostics.</p></div>
+      <details class="advanced">
+        <summary>Security, recovery, and connection details</summary>
+        <p class="muted">Certificate and SSH host-key validation always fail closed. Secrets are stored in the operating system credential store.</p>
+        <div class="recovery">
+          <button id="reveal-recovery" type="button">Reveal recovery code</button>
+          <div class="input-action"><input id="import-code" type="password" placeholder="hsync1: recovery code" /><button id="import-recovery" type="button">Import</button></div>
+        </div>
+        <div id="diagnostic-list" class="diagnostics"><p class="muted">Sign in to see connection checks.</p></div>
+      </details>
     </section>
   </main>
   <div id="toast" role="status" aria-live="polite"></div>
@@ -127,12 +126,13 @@ const value = (id: string) => byId<HTMLInputElement>(id).value;
 const selectValue = (id: string) => byId<HTMLSelectElement>(id).value;
 
 document.querySelectorAll<HTMLButtonElement>(".tab").forEach((button) => {
-  button.addEventListener("click", () => {
-    document.querySelectorAll(".tab, .panel").forEach((item) => item.classList.remove("active"));
-    button.classList.add("active");
-    byId(button.dataset.tab!).classList.add("active");
-  });
+  button.addEventListener("click", () => showTab(button.dataset.tab!));
 });
+function showTab(tab: string) {
+  document.querySelectorAll(".tab, .panel").forEach((item) => item.classList.remove("active"));
+  document.querySelector<HTMLButtonElement>(`.tab[data-tab="${tab}"]`)?.classList.add("active");
+  byId(tab).classList.add("active");
+}
 
 byId("mode-https").addEventListener("click", () => setMode("https"));
 byId("mode-ssh").addEventListener("click", () => setMode("ssh"));
@@ -168,7 +168,7 @@ byId("calculate-pin").addEventListener("click", async () => {
 
 byId<HTMLFormElement>("https-form").addEventListener("submit", async (event) => {
   event.preventDefault();
-  await runConnection("connect_https", {
+  await runLogin("connect_https", {
     url: value("https-url"), port: Number(value("https-port")), apiToken: value("https-token"),
     certificateMode: selectValue("certificate-mode"), certificatePath: value("certificate-path") || null,
     spkiPin: value("spki-pin") || null, deviceName: value("https-device"),
@@ -176,7 +176,7 @@ byId<HTMLFormElement>("https-form").addEventListener("submit", async (event) => 
 });
 byId<HTMLFormElement>("ssh-form").addEventListener("submit", async (event) => {
   event.preventDefault();
-  await runConnection("connect_ssh", {
+  await runLogin("connect_ssh", {
     host: value("ssh-host"), port: Number(value("ssh-port")), username: value("ssh-username"),
     privateKey: value("ssh-key"), privateKeyPassphrase: value("ssh-passphrase") || null,
     remoteSocket: value("ssh-socket"), apiToken: value("ssh-token"),
@@ -184,85 +184,236 @@ byId<HTMLFormElement>("ssh-form").addEventListener("submit", async (event) => {
   });
 });
 
-async function runConnection(command: string, input: unknown) {
+async function runLogin(command: string, input: unknown) {
   setBusy(true);
   try {
-    const report = await invoke<DiagnosticReport>(command, { input });
+    const result = await invoke<LoginResult>(command, { input });
     connected = true;
-    byId("connection-badge").textContent = "Connected";
+    byId("connection-badge").textContent = "Signed in";
     byId("connection-badge").className = "badge success";
-    renderDiagnostics(report);
-    updateActionState();
-    toast("Secure connection established.", false);
+    renderDiagnostics(result.diagnostics);
+    if (result.sync) renderFeedback(result.sync);
+    await discover();
+    showTab("profiles");
+    toast(result.sync?.message ?? "Signed in. Choose a default profile to enable login sync.", false);
   } catch (error) {
     connected = false;
-    byId("connection-badge").textContent = "Connection failed";
+    byId("connection-badge").textContent = "Sign-in failed";
     byId("connection-badge").className = "badge error";
     toast(String(error), true);
   } finally { setBusy(false); }
 }
 
-byId("refresh-profiles").addEventListener("click", discover);
+byId("refresh-profiles").addEventListener("click", () => void discover());
 async function discover() {
   try {
-    const report = await invoke<DiscoveryReport>("discover_profiles");
+    const report = await invoke<ProfileReport>("discover_profiles");
     profiles = report.profiles;
-    byId("installation-summary").textContent = `Helium data: ${report.installation.user_data_dir} · ${profiles.length} profile(s)`;
+    if (!profiles.some((profile) => profile.directoryName === selectedProfile)) {
+      selectedProfile = profiles.find((profile) => profile.isDefault)?.directoryName ?? profiles[0]?.directoryName ?? null;
+    }
     renderProfiles();
   } catch (error) {
     profiles = [];
-    byId("installation-summary").textContent = String(error);
-    renderProfiles();
+    renderProfiles(String(error));
   }
 }
 
-function renderProfiles() {
+function renderProfiles(error?: string) {
   const list = byId("profile-list");
   list.replaceChildren();
+  if (error) {
+    const message = document.createElement("p");
+    message.className = "empty-state error-text";
+    message.textContent = error;
+    list.append(message);
+    return;
+  }
+  if (profiles.length === 0) {
+    const message = document.createElement("p");
+    message.className = "empty-state";
+    message.textContent = "No Helium profiles were found.";
+    list.append(message);
+    return;
+  }
+
   for (const profile of profiles) {
-    const readable = profile.bookmark_status === "readable";
-    const card = document.createElement("button");
-    card.className = `profile-card${selectedProfile === profile.directory_name ? " selected" : ""}`;
-    card.type = "button";
+    const readable = profile.bookmarkStatus === "readable";
+    const selected = selectedProfile === profile.directoryName;
+    const card = document.createElement("article");
+    card.className = `profile-card${selected ? " selected" : ""}`;
+    card.tabIndex = 0;
+    card.addEventListener("click", (event) => {
+      if ((event.target as HTMLElement).closest("button, input")) return;
+      selectedProfile = profile.directoryName;
+      renderProfiles();
+    });
+    card.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        selectedProfile = profile.directoryName;
+        renderProfiles();
+      }
+    });
+
+    const selector = document.createElement("input");
+    selector.type = "radio";
+    selector.name = "selected-profile";
+    selector.checked = selected;
+    selector.ariaLabel = `Select ${profile.displayName}`;
+    selector.addEventListener("change", () => { selectedProfile = profile.directoryName; renderProfiles(); });
+
+    const identity = document.createElement("div");
+    identity.className = "profile-identity";
+    const titleRow = document.createElement("div");
+    titleRow.className = "profile-title";
     const title = document.createElement("strong");
-    title.textContent = profile.display_name;
-    const path = document.createElement("span");
-    path.textContent = profile.path;
-    const status = document.createElement("em");
-    status.className = readable ? "ok" : "warning";
-    status.textContent = readable ? "Bookmarks readable" : bookmarkStatus(profile.bookmark_status);
-    card.append(title, path, status);
-    card.addEventListener("click", () => { selectedProfile = profile.directory_name; renderProfiles(); });
+    title.textContent = profile.displayName;
+    const rename = document.createElement("button");
+    rename.type = "button";
+    rename.className = "text-button";
+    rename.textContent = "Rename";
+    rename.addEventListener("click", () => void beginRename(profile, identity));
+    titleRow.append(title, rename);
+    const browserName = document.createElement("span");
+    browserName.textContent = profile.browserName === profile.displayName
+      ? `Helium ${profile.directoryName}`
+      : `Helium name: ${profile.browserName} · ${profile.directoryName}`;
+    const chips = document.createElement("div");
+    chips.className = "chips";
+    chips.append(
+      chip(profile.isDefault ? "Default at sign-in" : "Manual", profile.isDefault ? "default" : ""),
+      chip(profile.hasSavedCopy ? "Saved on server" : "Not saved yet", profile.hasSavedCopy ? "saved" : ""),
+      chip(readable ? "Ready" : bookmarkStatus(profile.bookmarkStatus), readable ? "ready" : "warning"),
+    );
+    identity.append(titleRow, browserName, chips);
+
+    const stats = document.createElement("div");
+    stats.className = "profile-stats";
+    stats.textContent = profile.stats
+      ? `${profile.stats.bookmarks.toLocaleString()} bookmarks · ${profile.stats.folders.toLocaleString()} folders · ${formatBytes(profile.stats.bytes)}`
+      : "Bookmark statistics unavailable";
+
+    const actions = document.createElement("div");
+    actions.className = "profile-actions";
+    const makeDefault = document.createElement("button");
+    makeDefault.type = "button";
+    makeDefault.textContent = profile.isDefault ? "Default" : "Use at sign-in";
+    makeDefault.disabled = profile.isDefault;
+    makeDefault.addEventListener("click", () => void setDefault(profile));
+    const save = document.createElement("button");
+    save.type = "button";
+    save.className = "primary";
+    save.textContent = "Save";
+    save.title = "Encrypt and save the current local bookmarks to the server";
+    save.disabled = !connected || !readable;
+    save.addEventListener("click", () => void runProfileAction("save_profile", profile));
+    const load = document.createElement("button");
+    load.type = "button";
+    load.textContent = "Load";
+    load.title = "Back up the local Bookmarks file, then load the saved server copy";
+    load.disabled = !connected || !profile.hasSavedCopy;
+    load.addEventListener("click", () => void confirmLoad(profile));
+    actions.append(makeDefault, save, load);
+
+    card.append(selector, identity, stats, actions);
     list.append(card);
   }
-  if (profiles.length === 0) list.textContent = "No Helium profiles were found.";
-  updateActionState();
+}
+
+function chip(text: string, variant: string) {
+  const element = document.createElement("span");
+  element.className = `chip ${variant}`;
+  element.textContent = text;
+  return element;
+}
+
+async function beginRename(profile: Profile, container: HTMLElement) {
+  const titleRow = container.querySelector(".profile-title")!;
+  titleRow.replaceChildren();
+  const input = document.createElement("input");
+  input.value = profile.displayName;
+  input.maxLength = 128;
+  input.ariaLabel = "Profile name";
+  const save = document.createElement("button");
+  save.type = "button";
+  save.textContent = "Save name";
+  const submit = async () => {
+    const name = input.value.trim();
+    if (!name) { toast("Profile name cannot be empty.", true); return; }
+    setBusy(true);
+    try {
+      const report = await invoke<ProfileReport>("rename_profile", { profileDirectory: profile.directoryName, displayName: name });
+      profiles = report.profiles;
+      renderProfiles();
+      toast(`Renamed profile to ${name}.`, false);
+    } catch (error) { toast(String(error), true); }
+    finally { setBusy(false); }
+  };
+  save.addEventListener("click", () => void submit());
+  input.addEventListener("keydown", (event) => { if (event.key === "Enter") void submit(); });
+  titleRow.append(input, save);
+  input.focus();
+  input.select();
+}
+
+async function setDefault(profile: Profile) {
+  setBusy(true);
+  try {
+    const report = await invoke<ProfileReport>("set_default_profile", { profileDirectory: profile.directoryName });
+    profiles = report.profiles;
+    selectedProfile = profile.directoryName;
+    renderProfiles();
+    toast(`${profile.displayName} will sync automatically when you sign in.`, false);
+  } catch (error) { toast(String(error), true); }
+  finally { setBusy(false); }
+}
+
+function confirmLoad(profile: Profile) {
+  const confirmed = window.confirm(
+    `Load the saved copy into ${profile.displayName}?\n\nThe current local Bookmarks file will first be backed up as a ZIP in Downloads. Close Helium before continuing so it cannot overwrite the restored file.`,
+  );
+  if (confirmed) void runProfileAction("load_profile", profile);
+}
+
+async function runProfileAction(command: "save_profile" | "load_profile", profile: Profile) {
+  setBusy(true);
+  try {
+    const feedback = await invoke<SyncFeedback>(command, { profileDirectory: profile.directoryName });
+    renderFeedback(feedback);
+    await discover();
+    toast(feedback.message, false);
+  } catch (error) { toast(String(error), true); }
+  finally { setBusy(false); }
+}
+
+function renderFeedback(feedback: SyncFeedback) {
+  const panel = byId("sync-feedback");
+  panel.replaceChildren();
+  const title = document.createElement("strong");
+  title.textContent = `${feedback.action === "saved" ? "Saved" : "Loaded"} ${feedback.profileName}`;
+  const summary = document.createElement("span");
+  summary.textContent = `${feedback.stats.bookmarks.toLocaleString()} bookmarks · ${feedback.stats.folders.toLocaleString()} folders · ${formatBytes(feedback.stats.bytes)}`;
+  panel.append(title, summary);
+  if (feedback.backupPath) {
+    const backup = document.createElement("span");
+    backup.className = "backup-path";
+    backup.textContent = `Local backup: ${feedback.backupPath}`;
+    panel.append(backup);
+  }
+  panel.classList.remove("hidden");
 }
 
 function bookmarkStatus(status: BookmarkStatus): string {
   if (status === "missing") return "Bookmarks file missing";
-  if (status === "readable") return "Bookmarks readable";
-  return `Bookmark parse failed: ${status.invalid}`;
+  if (status === "readable") return "Ready";
+  return `Invalid bookmarks: ${status.invalid}`;
 }
 
-function updateActionState() {
-  byId<HTMLButtonElement>("run-synthetic").disabled = !connected;
-  const selected = profiles.find((profile) => profile.directory_name === selectedProfile);
-  byId<HTMLButtonElement>("run-bookmarks").disabled = !connected || selected?.bookmark_status !== "readable";
-}
-
-byId("run-synthetic").addEventListener("click", () => runProof("run_synthetic", {}));
-byId("run-bookmarks").addEventListener("click", () => runProof("run_bookmarks", { profileDirectory: selectedProfile }));
-async function runProof(command: string, args: Record<string, unknown>) {
-  setBusy(true);
-  try {
-    const proof = await invoke<SyncProof>(command, args);
-    const result = byId("proof-result");
-    result.textContent = `${proof.namespace}\nObject ${proof.object_id}\nRevision ${proof.revision} · Cursor ${proof.cursor}\nDecrypted comparison: ${proof.plaintext_matches ? "MATCH" : "FAILED"}`;
-    result.classList.remove("hidden");
-    toast("Encrypted round trip verified.", false);
-  } catch (error) { toast(String(error), true); }
-  finally { setBusy(false); }
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 byId("reveal-recovery").addEventListener("click", async () => {
@@ -276,8 +427,10 @@ byId("import-recovery").addEventListener("click", async () => {
   try {
     await invoke("import_recovery_code", { recoveryCode: value("import-code") });
     connected = false;
-    updateActionState();
-    toast("Recovery code imported. Reconnect to use the imported key.", false);
+    byId("connection-badge").textContent = "Signed out";
+    byId("connection-badge").className = "badge idle";
+    await discover();
+    toast("Recovery code imported. Sign in again to use it.", false);
   } catch (error) { toast(String(error), true); }
 });
 
@@ -306,6 +459,7 @@ function setBusy(busy: boolean) {
     if (!busy) delete button.dataset.wasDisabled;
   });
 }
+
 let toastTimer = 0;
 function toast(message: string, isError: boolean) {
   const element = byId("toast");

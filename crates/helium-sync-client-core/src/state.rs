@@ -8,6 +8,19 @@ use sqlx::{
 
 use crate::ClientError;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfilePreference {
+    pub directory_name: String,
+    pub display_name: String,
+    pub is_default: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectMapping {
+    pub object_id: ObjectId,
+    pub revision: u64,
+}
+
 pub struct LocalState {
     pool: SqlitePool,
 }
@@ -123,6 +136,132 @@ impl LocalState {
             .execute(&self.pool).await.map_err(|error| ClientError::State(error.to_string()))?;
         Ok(())
     }
+
+    pub async fn mapping(
+        &self,
+        server_id: &str,
+        namespace: &str,
+        local_key: &str,
+    ) -> Result<Option<ObjectMapping>, ClientError> {
+        let row = sqlx::query(
+            "SELECT object_id, revision FROM object_mappings WHERE server_id=? AND namespace=? AND local_key=?",
+        )
+        .bind(server_id)
+        .bind(namespace)
+        .bind(local_key)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| ClientError::State(error.to_string()))?;
+        row.map(|row| {
+            let object_id = uuid::Uuid::parse_str(&row.get::<String, _>("object_id"))
+                .map(ObjectId)
+                .map_err(|error| ClientError::State(error.to_string()))?;
+            let revision = u64::try_from(row.get::<i64, _>("revision"))
+                .map_err(|error| ClientError::State(error.to_string()))?;
+            Ok(ObjectMapping {
+                object_id,
+                revision,
+            })
+        })
+        .transpose()
+    }
+
+    pub async fn ensure_profile(
+        &self,
+        directory_name: &str,
+        display_name: &str,
+    ) -> Result<(), ClientError> {
+        sqlx::query(
+            "INSERT INTO profile_preferences (directory_name, display_name) VALUES (?, ?) ON CONFLICT(directory_name) DO NOTHING",
+        )
+        .bind(directory_name)
+        .bind(display_name)
+        .execute(&self.pool)
+        .await
+        .map_err(|error| ClientError::State(error.to_string()))?;
+        Ok(())
+    }
+
+    pub async fn profile_preferences(&self) -> Result<Vec<ProfilePreference>, ClientError> {
+        let rows = sqlx::query(
+            "SELECT directory_name, display_name, is_default FROM profile_preferences ORDER BY display_name COLLATE NOCASE, directory_name",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| ClientError::State(error.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(|row| ProfilePreference {
+                directory_name: row.get("directory_name"),
+                display_name: row.get("display_name"),
+                is_default: row.get::<i64, _>("is_default") == 1,
+            })
+            .collect())
+    }
+
+    pub async fn rename_profile(
+        &self,
+        directory_name: &str,
+        display_name: &str,
+    ) -> Result<(), ClientError> {
+        let display_name = display_name.trim();
+        if display_name.is_empty() || display_name.chars().count() > 128 {
+            return Err(ClientError::State(
+                "profile name must contain 1 to 128 characters".to_owned(),
+            ));
+        }
+        let result = sqlx::query(
+            "UPDATE profile_preferences SET display_name=?, updated_at=CURRENT_TIMESTAMP WHERE directory_name=?",
+        )
+        .bind(display_name)
+        .bind(directory_name)
+        .execute(&self.pool)
+        .await
+        .map_err(|error| ClientError::State(error.to_string()))?;
+        if result.rows_affected() != 1 {
+            return Err(ClientError::State("profile is not registered".to_owned()));
+        }
+        Ok(())
+    }
+
+    pub async fn set_default_profile(&self, directory_name: &str) -> Result<(), ClientError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|error| ClientError::State(error.to_string()))?;
+        let exists = sqlx::query("SELECT 1 FROM profile_preferences WHERE directory_name=?")
+            .bind(directory_name)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|error| ClientError::State(error.to_string()))?
+            .is_some();
+        if !exists {
+            return Err(ClientError::State("profile is not registered".to_owned()));
+        }
+        sqlx::query("UPDATE profile_preferences SET is_default=0 WHERE is_default=1")
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| ClientError::State(error.to_string()))?;
+        sqlx::query("UPDATE profile_preferences SET is_default=1, updated_at=CURRENT_TIMESTAMP WHERE directory_name=?")
+            .bind(directory_name)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| ClientError::State(error.to_string()))?;
+        transaction
+            .commit()
+            .await
+            .map_err(|error| ClientError::State(error.to_string()))?;
+        Ok(())
+    }
+
+    pub async fn default_profile(&self) -> Result<Option<ProfilePreference>, ClientError> {
+        Ok(self
+            .profile_preferences()
+            .await?
+            .into_iter()
+            .find(|profile| profile.is_default))
+    }
 }
 
 #[cfg(test)]
@@ -151,6 +290,49 @@ mod tests {
         assert_eq!(
             row.get::<String, _>("endpoint"),
             "https://example.test:7500"
+        );
+    }
+
+    #[tokio::test]
+    async fn persists_profile_names_default_and_object_mapping() {
+        let state = LocalState::memory().await.unwrap();
+        state.ensure_profile("Default", "Person 1").await.unwrap();
+        state.ensure_profile("Profile 2", "Work").await.unwrap();
+        state.rename_profile("Default", "Personal").await.unwrap();
+        state.set_default_profile("Default").await.unwrap();
+
+        let profiles = state.profile_preferences().await.unwrap();
+        assert_eq!(profiles.len(), 2);
+        assert_eq!(
+            state.default_profile().await.unwrap().unwrap().display_name,
+            "Personal"
+        );
+
+        state.set_default_profile("Profile 2").await.unwrap();
+        assert_eq!(
+            state
+                .default_profile()
+                .await
+                .unwrap()
+                .unwrap()
+                .directory_name,
+            "Profile 2"
+        );
+
+        let object_id = ObjectId::new();
+        state
+            .save_mapping("server", "helium.bookmarks.v1", "Profile 2", object_id, 4)
+            .await
+            .unwrap();
+        assert_eq!(
+            state
+                .mapping("server", "helium.bookmarks.v1", "Profile 2")
+                .await
+                .unwrap(),
+            Some(ObjectMapping {
+                object_id,
+                revision: 4
+            })
         );
     }
 }
