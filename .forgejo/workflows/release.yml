@@ -47,7 +47,7 @@ env:
 jobs:
   validate-tag:
     name: Validate release tag
-    if: ${{ startsWith(forgejo.ref, 'refs/tags/v.') || startsWith(forgejo.ref, 'refs/tags/V.') || startsWith(github.ref, 'refs/tags/v.') || startsWith(github.ref, 'refs/tags/V.') }}
+    if: ${{ startsWith(forgejo.ref, 'refs/tags/v') || startsWith(forgejo.ref, 'refs/tags/V') || startsWith(github.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/tags/V') }}
     runs-on: ubuntu-22.04
     outputs:
       version: ${{ steps.version.outputs.version }}
@@ -64,12 +64,12 @@ jobs:
           set -Eeuo pipefail
 
           tag="${FORGEJO_REF_NAME:-${GITHUB_REF_NAME:-}}"
-          if [[ ! "$tag" =~ ^[vV]\..+$ ]]; then
-            echo "Release tag must begin with v. or V.; received '${tag:-<empty>}'." >&2
+          if [[ ! "$tag" =~ ^[vV].+$ ]]; then
+            echo "Release tag must begin with v or V; received '${tag:-<empty>}'." >&2
             exit 1
           fi
 
-          version="${tag:2}"
+          version="${tag:1}"
           workspace_version="$(awk '
             /^\[workspace\.package\]$/ { in_workspace_package = 1; next }
             /^\[/ { in_workspace_package = 0 }
