@@ -128,20 +128,37 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            build-essential \
-            ca-certificates \
-            curl \
-            file \
-            libayatana-appindicator3-dev \
-            librsvg2-dev \
-            libssl-dev \
-            libwebkit2gtk-4.1-dev \
-            libxdo-dev \
-            pkg-config \
-            tar \
-            xz-utils
+          if command -v sudo >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+              build-essential \
+              ca-certificates \
+              curl \
+              file \
+              libayatana-appindicator3-dev \
+              librsvg2-dev \
+              libssl-dev \
+              libwebkit2gtk-4.1-dev \
+              libxdo-dev \
+              pkg-config \
+              tar \
+              xz-utils
+          else
+            apt-get update
+            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+              build-essential \
+              ca-certificates \
+              curl \
+              file \
+              libayatana-appindicator3-dev \
+              librsvg2-dev \
+              libssl-dev \
+              libwebkit2gtk-4.1-dev \
+              libxdo-dev \
+              pkg-config \
+              tar \
+              xz-utils
+          fi
 
       - name: Install pinned Rust and Node toolchains
         shell: bash
@@ -235,9 +252,15 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            ca-certificates curl xz-utils zip
+          if command -v sudo >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+              ca-certificates curl xz-utils zip
+          else
+            apt-get update
+            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+              ca-certificates curl xz-utils zip
+          fi
 
       - name: Install pinned Rust and Node toolchains
         shell: bash
@@ -387,9 +410,15 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            ca-certificates curl tar xz-utils
+          if command -v sudo >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+              ca-certificates curl tar xz-utils
+          else
+            apt-get update
+            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+              ca-certificates curl tar xz-utils
+          fi
 
           node_archive="node-v${NODE_VERSION}-linux-x64.tar.xz"
           node_url="https://nodejs.org/dist/v${NODE_VERSION}"
@@ -423,9 +452,15 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            ca-certificates curl gnupg jq
+          if command -v sudo >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+              ca-certificates curl gnupg jq
+          else
+            apt-get update
+            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+              ca-certificates curl gnupg jq
+          fi
 
       - name: Create and verify checksums and detached signatures
         shell: bash
