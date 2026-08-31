@@ -91,29 +91,12 @@ jobs:
           fi
 
           version="${tag:1}"
-          workspace_version="$(awk '
-            /^\[workspace\.package\]$/ { in_workspace_package = 1; next }
-            /^\[/ { in_workspace_package = 0 }
-            in_workspace_package && /^version[[:space:]]*=/ {
-              value = $0
-              sub(/^[^=]*=[[:space:]]*"/, "", value)
-              sub(/"[[:space:]]*$/, "", value)
-              print value
-              exit
-            }
-          ' Cargo.toml)"
           client_version="$(sed -n 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
             crates/helium-sync-client/package.json | head -n 1)"
           tauri_version="$(sed -n 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
             crates/helium-sync-client/src-tauri/tauri.conf.json | head -n 1)"
 
-          if [[ -z "$workspace_version" ]]; then
-            echo "Could not read workspace.package.version from Cargo.toml." >&2
-            exit 1
-          fi
-
           for version_source in \
-            "workspace Cargo.toml:$workspace_version" \
             "client package.json:$client_version" \
             "Tauri configuration:$tauri_version"; do
             source_name="${version_source%%:*}"
