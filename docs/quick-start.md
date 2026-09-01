@@ -50,4 +50,6 @@ npm run tauri dev
 
 For the generated certificate, select custom CA and choose `server.crt`. Close Helium, create or select a profile, choose a default, and use **Sync now** or leave **Automatic** enabled. Import the first device's `hsync1:` recovery code on every additional trusted device. **Launch** starts Helium with the selected profile directory. Keep Helium closed during every create, sync, restore, or switch operation; Zstandard-compressed ZIP backups are created in Downloads before local bookmark or extension replacement.
 
+Successful connection forms are restored from the operating-system keyring on the next launch. For SSH keys, `~/.ssh/id_ed25519` is accepted directly and expanded using the current user's home directory.
+
 Linux native packages expose the `helium` launcher on `PATH`. For an AppImage, extracted archive, or another nonstandard installation, set `HELIUM_SYNC_HELIUM_PATH` to the Helium executable before starting Helium Sync.

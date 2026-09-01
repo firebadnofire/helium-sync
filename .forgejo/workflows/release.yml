@@ -22,6 +22,10 @@ env:
       and extension-owned data.
     - Zstandard backups, chunk verification, and explicit extension conflict
       handling while Helium is closed.
+    - System-keyring persistence for complete HTTPS and SSH connection settings.
+    - Recoverable profile archives with restore and confirmed permanent deletion.
+    - Compact-window layout fixes, macOS `~/.ssh` support, and resilient profile
+      discovery when a server contains objects from another recovery key.
 
     Assets:
     - Linux x86_64 server tarball: `helium-sync-server-linux-x86_64.tar.zst`

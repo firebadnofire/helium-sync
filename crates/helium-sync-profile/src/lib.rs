@@ -346,6 +346,14 @@ pub fn enumerate_profiles(user_data_dir: &Path) -> Result<Vec<DiscoveredProfile>
 /// `--profile-directory` argument. The create-new operation makes collisions visible rather than
 /// reusing an existing profile after a concurrent request.
 pub fn create_profile(user_data_dir: &Path) -> Result<DiscoveredProfile, ProfileError> {
+    create_profile_with_reserved(user_data_dir, &BTreeSet::new())
+}
+
+/// Reserves the next profile directory while preserving names held by archived profiles.
+pub fn create_profile_with_reserved(
+    user_data_dir: &Path,
+    reserved_directory_names: &BTreeSet<String>,
+) -> Result<DiscoveredProfile, ProfileError> {
     if !user_data_dir.is_dir() {
         return Err(ProfileError::Read {
             path: user_data_dir.to_path_buf(),
@@ -357,6 +365,9 @@ pub fn create_profile(user_data_dir: &Path) -> Result<DiscoveredProfile, Profile
     }
     for number in 1_u32..=u32::MAX {
         let directory_name = format!("Profile {number}");
+        if reserved_directory_names.contains(&directory_name) {
+            continue;
+        }
         let path = user_data_dir.join(&directory_name);
         match fs::create_dir(&path) {
             Ok(()) => {
@@ -1891,6 +1902,18 @@ mod tests {
         assert_eq!(created.directory_name, "Profile 2");
         assert!(created.path.is_dir());
         assert_eq!(created.bookmark_status, BookmarkStatus::Missing);
+    }
+
+    #[test]
+    fn archived_profile_names_remain_reserved() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join("Default")).unwrap();
+        let reserved = BTreeSet::from(["Profile 1".to_owned()]);
+
+        let created = create_profile_with_reserved(temp.path(), &reserved).unwrap();
+
+        assert_eq!(created.directory_name, "Profile 2");
+        assert!(!temp.path().join("Profile 1").exists());
     }
 
     #[test]

@@ -17,6 +17,15 @@ pub struct ProfilePreference {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileArchive {
+    pub id: String,
+    pub directory_name: String,
+    pub archive_directory: String,
+    pub display_name: String,
+    pub archived_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectMapping {
     pub object_id: ObjectId,
     pub revision: u64,
@@ -340,6 +349,71 @@ impl LocalState {
             .into_iter()
             .find(|profile| profile.is_default))
     }
+
+    pub async fn record_profile_archive(
+        &self,
+        id: &str,
+        directory_name: &str,
+        archive_directory: &str,
+        display_name: &str,
+    ) -> Result<(), ClientError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|error| ClientError::State(error.to_string()))?;
+        sqlx::query("INSERT INTO profile_archives (id, directory_name, archive_directory, display_name) VALUES (?, ?, ?, ?)")
+            .bind(id)
+            .bind(directory_name)
+            .bind(archive_directory)
+            .bind(display_name)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| ClientError::State(error.to_string()))?;
+        sqlx::query("UPDATE profile_preferences SET is_default=0, updated_at=CURRENT_TIMESTAMP WHERE directory_name=?")
+            .bind(directory_name)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| ClientError::State(error.to_string()))?;
+        transaction
+            .commit()
+            .await
+            .map_err(|error| ClientError::State(error.to_string()))?;
+        Ok(())
+    }
+
+    pub async fn profile_archives(&self) -> Result<Vec<ProfileArchive>, ClientError> {
+        let rows = sqlx::query(
+            "SELECT id, directory_name, archive_directory, display_name, archived_at FROM profile_archives ORDER BY archived_at DESC, display_name COLLATE NOCASE",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| ClientError::State(error.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(|row| ProfileArchive {
+                id: row.get("id"),
+                directory_name: row.get("directory_name"),
+                archive_directory: row.get("archive_directory"),
+                display_name: row.get("display_name"),
+                archived_at: row.get("archived_at"),
+            })
+            .collect())
+    }
+
+    pub async fn remove_profile_archive(&self, id: &str) -> Result<(), ClientError> {
+        let result = sqlx::query("DELETE FROM profile_archives WHERE id=?")
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|error| ClientError::State(error.to_string()))?;
+        if result.rows_affected() != 1 {
+            return Err(ClientError::State(
+                "profile archive is not registered".to_owned(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -453,5 +527,32 @@ mod tests {
                 .revision,
             5
         );
+    }
+
+    #[tokio::test]
+    async fn archives_clear_default_and_can_be_removed() {
+        let state = LocalState::memory().await.unwrap();
+        state.ensure_profile("Profile 2", "Work").await.unwrap();
+        state.set_default_profile("Profile 2").await.unwrap();
+        state
+            .record_profile_archive("archive-id", "Profile 2", "archive-dir", "Work")
+            .await
+            .unwrap();
+
+        assert!(state.default_profile().await.unwrap().is_none());
+        assert_eq!(
+            state.profile_archives().await.unwrap(),
+            vec![ProfileArchive {
+                id: "archive-id".to_owned(),
+                directory_name: "Profile 2".to_owned(),
+                archive_directory: "archive-dir".to_owned(),
+                display_name: "Work".to_owned(),
+                archived_at: state.profile_archives().await.unwrap()[0]
+                    .archived_at
+                    .clone(),
+            }]
+        );
+        state.remove_profile_archive("archive-id").await.unwrap();
+        assert!(state.profile_archives().await.unwrap().is_empty());
     }
 }

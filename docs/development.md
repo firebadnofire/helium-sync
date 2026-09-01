@@ -16,7 +16,7 @@ cargo check -p helium-sync-client
 
 ## Release preparation
 
-Rust workspace, npm client, and Tauri versions must match exactly. The release workflow accepts only a matching SemVer tag such as `v0.4.0` and fails before building when any source version differs. First-party release archives are `.tar.zst`; gzip and deflate archives are not produced.
+Rust workspace, npm client, and Tauri versions must match exactly. The release workflow accepts only a matching SemVer tag such as `v0.5.0` and fails before building when any source version differs. First-party release archives are `.tar.zst`; gzip and deflate archives are not produced.
 
 Before creating a tag, run the full check, parse `.forgejo/workflows/release.yml` as YAML, validate every embedded `run` block with Linux `bash -n`, and build the platform release bundle. Local success does not prove hosted runners, configured signing secrets, detached-signature publication, or mirrored releases.
 

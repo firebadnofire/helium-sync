@@ -233,7 +233,11 @@ impl ClientCore {
             .collect::<Vec<_>>();
         candidates.sort_unstable_by_key(|(_, cursor)| std::cmp::Reverse(*cursor));
         for (object_id, _) in candidates {
-            let (snapshot, proof) = self.load_bookmarks(object_id).await?;
+            let (snapshot, proof) = match self.load_bookmarks(object_id).await {
+                Ok(value) => value,
+                Err(error) if is_undecryptable_candidate(&error) => continue,
+                Err(error) => return Err(error),
+            };
             if snapshot.profile_directory == profile_directory {
                 return Ok(Some((snapshot, proof)));
             }
@@ -413,7 +417,11 @@ impl ClientCore {
             .collect::<Vec<_>>();
         candidates.sort_unstable_by_key(|(_, cursor)| std::cmp::Reverse(*cursor));
         for (object_id, _) in candidates {
-            let (manifest, proof) = self.load_extension_manifest(object_id).await?;
+            let (manifest, proof) = match self.load_extension_manifest(object_id).await {
+                Ok(value) => value,
+                Err(error) if is_undecryptable_candidate(&error) => continue,
+                Err(error) => return Err(error),
+            };
             if manifest.profile_directory == profile_directory {
                 return Ok(Some((manifest, proof)));
             }
@@ -527,6 +535,14 @@ impl ClientCore {
             plaintext_matches: matches,
         })
     }
+}
+
+fn is_undecryptable_candidate(error: &ClientError) -> bool {
+    matches!(
+        error,
+        ClientError::Crypto(message)
+            if message == "ciphertext authentication failed; payload or metadata was changed"
+    )
 }
 
 fn sha256_bytes(bytes: &[u8]) -> String {
@@ -785,5 +801,102 @@ mod tests {
         assert_eq!(discovered, expected);
         assert_eq!(proof.object_id, saved.object_id);
         assert_eq!(proof.revision, saved.revision);
+    }
+
+    #[tokio::test]
+    async fn profile_discovery_skips_objects_encrypted_with_another_recovery_key() {
+        let pool = helium_sync_server::storage::memory().await.unwrap();
+        let state = helium_sync_server::api::AppState::new(
+            pool,
+            &SecretString::from("0123456789abcdef0123456789abcdef".to_owned()),
+        );
+        let router = helium_sync_server::router(state);
+        let token = || SecretString::from("0123456789abcdef0123456789abcdef".to_owned());
+        let core = ClientCore::new(
+            Arc::new(ApiClient::new(
+                Arc::new(RouterTransport {
+                    router: router.clone(),
+                }),
+                token(),
+            )),
+            MasterKey::generate(),
+            DeviceId::new(),
+        );
+        let foreign = ClientCore::new(
+            Arc::new(ApiClient::new(
+                Arc::new(RouterTransport { router }),
+                token(),
+            )),
+            MasterKey::generate(),
+            DeviceId::new(),
+        );
+        core.register_device("current recovery key").await.unwrap();
+        foreign
+            .register_device("different recovery key")
+            .await
+            .unwrap();
+
+        let temp = tempfile::tempdir().unwrap();
+        let make_profile = |directory_name: &str| {
+            let path = temp.path().join(directory_name);
+            std::fs::create_dir(&path).unwrap();
+            let bookmarks_path = path.join("Bookmarks");
+            std::fs::write(
+                &bookmarks_path,
+                r#"{"version":1,"roots":{"bookmark_bar":{"type":"folder","id":"1","name":"Bookmarks bar","children":[]}}}"#,
+            )
+            .unwrap();
+            DiscoveredProfile {
+                directory_name: directory_name.to_owned(),
+                display_name: directory_name.to_owned(),
+                path,
+                bookmarks_path,
+                bookmark_status: helium_sync_profile::BookmarkStatus::Readable,
+            }
+        };
+        let target = make_profile("Profile 2");
+        let unrelated = make_profile("Default");
+        let (target_proof, _) = core.save_bookmarks(&target, None, None).await.unwrap();
+        foreign
+            .save_bookmarks(&unrelated, None, None)
+            .await
+            .unwrap();
+
+        let (_, discovered_proof) = core
+            .discover_bookmarks("Profile 2")
+            .await
+            .unwrap()
+            .expect("the current key's older profile object should still be discovered");
+        assert_eq!(discovered_proof.object_id, target_proof.object_id);
+
+        let archive = b"extension archive".to_vec();
+        let descriptor = |profile_directory: &str| ExtensionBundleDescriptor {
+            format: "helium-extensions-v1".to_owned(),
+            profile_directory: profile_directory.to_owned(),
+            archive_sha256: sha256_bytes(&archive),
+            archive_bytes: archive.len() as u64,
+            stats: ExtensionBundleStats {
+                extensions: 1,
+                files: 1,
+                bytes: archive.len() as u64,
+            },
+        };
+        let (manifest_proof, _) = core
+            .save_extension_bundle(&descriptor("Profile 2"), &archive, None, None)
+            .await
+            .unwrap();
+        foreign
+            .save_extension_bundle(&descriptor("Default"), &archive, None, None)
+            .await
+            .unwrap();
+        let (_, discovered_manifest_proof) = core
+            .discover_extension_bundle("Profile 2")
+            .await
+            .unwrap()
+            .expect("the current key's older extension manifest should still be discovered");
+        assert_eq!(
+            discovered_manifest_proof.object_id,
+            manifest_proof.object_id
+        );
     }
 }

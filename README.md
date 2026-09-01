@@ -2,7 +2,7 @@
 
 Helium Sync is an encrypted profile launcher and multi-device synchronizer for the Helium browser. The desktop client creates and launches isolated Helium profiles, reconciles bookmarks, copies installed extensions and extension-owned data, encrypts everything locally, and stores only opaque ciphertext on a self-hosted Linux server.
 
-The first profile is presented as **You**. Add named profiles and launch any one with a click, similar to choosing an instance in MultiMC. Helium must be closed before creating, syncing, restoring, or switching profiles so Chromium cannot rewrite profile databases during the operation.
+The first profile is presented as **You**. Add named profiles and launch any one with a click, similar to choosing an instance in MultiMC. Profiles can be moved into recoverable local archives, restored later, or permanently deleted from the archive after confirmation. Helium must be closed before creating, syncing, archiving, restoring, deleting, or switching profiles so Chromium cannot rewrite profile databases during the operation.
 
 Independent bookmark additions, edits, and deletions are reconciled against an encrypted local merge base. Extension snapshots use conflict detection because their databases cannot be safely three-way merged. Every local replacement is backed up with Zstandard compression first. Open tabs, browsing history, passwords, website storage, and live in-browser synchronization are not synchronized.
 
@@ -15,6 +15,7 @@ Independent bookmark additions, edits, and deletions are reconciled against an e
 - XChaCha20-Poly1305 object encryption using client-held key material.
 - SQLite state, atomic batches, conflict detection, change cursors, and tombstones.
 - Cross-device encrypted profile discovery, three-way bookmark reconciliation, and chunked extension snapshots.
+- Versioned connection settings restored from the native operating-system keyring.
 - Docker Compose and hardened systemd deployment examples.
 
 ## Start here

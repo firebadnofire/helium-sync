@@ -21,6 +21,7 @@ tauri-plugin-dialog = "2"
 tempfile.workspace = true
 tokio.workspace = true
 url.workspace = true
+uuid.workspace = true
 
 [lints]
 workspace = true

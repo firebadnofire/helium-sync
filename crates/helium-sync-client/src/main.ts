@@ -15,7 +15,8 @@ type Profile = {
   hasSavedCopy: boolean;
   stats: BookmarkStats | null;
 };
-type ProfileReport = { profiles: Profile[] };
+type ProfileArchive = { id: string; directoryName: string; displayName: string; archivedAt: string };
+type ProfileReport = { profiles: Profile[]; archives: ProfileArchive[] };
 type DiagnosticCheck = { name: string; ok: boolean; summary: string; details: string };
 type DiagnosticReport = { checks: DiagnosticCheck[] };
 type SyncFeedback = {
@@ -32,6 +33,18 @@ type SyncFeedback = {
 };
 type LaunchResult = { profileName: string; sync: SyncFeedback | null; message: string };
 type LoginResult = { diagnostics: DiagnosticReport; sync: SyncFeedback | null };
+type HttpsSettings = {
+  url: string; port: number; apiToken: string; certificateMode: string;
+  certificatePath: string | null; spkiPin: string | null; deviceName: string;
+};
+type SshSettings = {
+  host: string; port: number; username: string; privateKey: string;
+  privateKeyPassphrase: string | null; remoteSocket: string; apiToken: string;
+  trustedFingerprint: string | null; deviceName: string;
+};
+type SavedConnection =
+  | { transport: "https"; settings: HttpsSettings }
+  | { transport: "ssh"; settings: SshSettings };
 
 const app = document.querySelector<HTMLDivElement>("#app")!;
 app.innerHTML = `
@@ -57,6 +70,11 @@ app.innerHTML = `
       </div>
       <aside class="launcher-note"><strong>Switch with Helium closed.</strong><span>Launch opens exactly one selected profile. Sync reads and replacements include bookmarks, installed extensions, and extension-owned data; replacements are backed up first.</span></aside>
       <div id="profile-list" class="profile-list" aria-live="polite"></div>
+      <section id="archive-section" class="archive-section hidden">
+        <div><p class="eyebrow">RECOVERABLE</p><h3>Archived profiles</h3></div>
+        <p class="muted">Restore an archived profile, or permanently delete it after review.</p>
+        <div id="archive-list" class="archive-list" aria-live="polite"></div>
+      </section>
       <section id="sync-feedback" class="feedback hidden" aria-live="polite"></section>
     </section>
 
@@ -99,7 +117,7 @@ app.innerHTML = `
         <label>SSH port<input id="ssh-port" type="number" min="1" max="65535" value="22" required /></label>
         <label>Username<input id="ssh-username" autocomplete="username" required /></label>
         <label class="wide">Private key (OpenSSH, PEM, or PuTTY .ppk)
-          <div class="input-action"><input id="ssh-key" required /><button type="button" id="browse-key">Browse</button></div>
+          <div class="input-action"><input id="ssh-key" value="~/.ssh/id_ed25519" required /><button type="button" id="browse-key">Browse</button></div>
         </label>
         <label class="wide">Private-key passphrase (optional)<input id="ssh-passphrase" type="password" autocomplete="off" /></label>
         <label class="wide">Remote socket<input id="ssh-socket" value="/run/helium-sync/server.sock" required /></label>
@@ -125,6 +143,7 @@ app.innerHTML = `
 
 let connected = false;
 let profiles: Profile[] = [];
+let archives: ProfileArchive[] = [];
 let selectedProfile: string | null = null;
 const syncInProgress = new Set<string>();
 const AUTOMATIC_SYNC_INTERVAL_MS = 30_000;
@@ -193,6 +212,7 @@ byId<HTMLFormElement>("ssh-form").addEventListener("submit", async (event) => {
 });
 
 async function runLogin(command: string, input: unknown) {
+  clearToast();
   setBusy(true);
   try {
     const result = await invoke<LoginResult>(command, { input });
@@ -222,6 +242,7 @@ async function addProfile() {
   try {
     const report = await invoke<ProfileReport>("create_browser_profile", { displayName });
     profiles = report.profiles;
+    archives = report.archives;
     selectedProfile = profiles.find((profile) => !previous.has(profile.directoryName))?.directoryName
       ?? selectedProfile;
     renderProfiles();
@@ -244,17 +265,20 @@ async function discover() {
   try {
     const report = await invoke<ProfileReport>("discover_profiles");
     profiles = report.profiles;
+    archives = report.archives;
     if (!profiles.some((profile) => profile.directoryName === selectedProfile)) {
       selectedProfile = profiles.find((profile) => profile.isDefault)?.directoryName ?? profiles[0]?.directoryName ?? null;
     }
     renderProfiles();
   } catch (error) {
     profiles = [];
+    archives = [];
     renderProfiles(String(error));
   }
 }
 
 function renderProfiles(error?: string) {
+  renderArchives();
   const list = byId("profile-list");
   list.replaceChildren();
   if (error) {
@@ -373,10 +397,85 @@ function renderProfiles(error?: string) {
     load.disabled = !connected || !profile.hasSavedCopy;
     load.addEventListener("click", () => void confirmLoad(profile));
     recovery.append(recoverySummary, save, load);
-    actions.append(launchButton, sync, makeDefault, autoSync, recovery);
+    const archive = document.createElement("button");
+    archive.type = "button";
+    archive.className = "archive-profile";
+    archive.textContent = "Archive";
+    archive.title = "Move this closed-browser profile into recoverable local archives";
+    archive.addEventListener("click", () => void archiveProfile(profile));
+    actions.append(launchButton, sync, makeDefault, autoSync, recovery, archive);
 
     card.append(selector, identity, stats, actions);
     list.append(card);
+  }
+}
+
+function renderArchives() {
+  const section = byId("archive-section");
+  const list = byId("archive-list");
+  list.replaceChildren();
+  section.classList.toggle("hidden", archives.length === 0);
+  for (const archive of archives) {
+    const card = document.createElement("article");
+    card.className = "archive-card";
+    const identity = document.createElement("div");
+    const title = document.createElement("strong");
+    title.textContent = archive.displayName;
+    const details = document.createElement("span");
+    details.textContent = `${archive.directoryName} · archived ${archive.archivedAt}`;
+    identity.append(title, details);
+    const actions = document.createElement("div");
+    actions.className = "archive-actions";
+    const restore = document.createElement("button");
+    restore.type = "button";
+    restore.textContent = "Restore";
+    restore.addEventListener("click", () => void restoreArchive(archive));
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "danger";
+    remove.textContent = "Delete permanently";
+    remove.addEventListener("click", () => void deleteArchive(archive));
+    actions.append(restore, remove);
+    card.append(identity, actions);
+    list.append(card);
+  }
+}
+
+async function archiveProfile(profile: Profile) {
+  const confirmed = window.confirm(
+    `Archive ${profile.displayName}?\n\nHelium must be closed. The complete local profile will be moved into Helium Sync's recoverable archive area and can be restored later.`,
+  );
+  if (!confirmed) return;
+  await runArchiveCommand("archive_profile", { profileDirectory: profile.directoryName }, `${profile.displayName} was archived.`);
+}
+
+async function restoreArchive(archive: ProfileArchive) {
+  await runArchiveCommand("restore_archived_profile", { archiveId: archive.id }, `${archive.displayName} was restored.`);
+}
+
+async function deleteArchive(archive: ProfileArchive) {
+  const confirmed = window.confirm(
+    `Permanently delete the archived profile ${archive.displayName}?\n\nThis removes its bookmarks, extensions, extension data, and all other local profile files. This cannot be undone.`,
+  );
+  if (!confirmed) return;
+  await runArchiveCommand("delete_archived_profile", { archiveId: archive.id }, `${archive.displayName} was permanently deleted.`);
+}
+
+async function runArchiveCommand(command: string, args: Record<string, string>, message: string) {
+  setBusy(true);
+  try {
+    const report = await invoke<ProfileReport>(command, args);
+    profiles = report.profiles;
+    archives = report.archives;
+    if (!profiles.some((profile) => profile.directoryName === selectedProfile)) {
+      selectedProfile = profiles.find((profile) => profile.isDefault)?.directoryName ?? profiles[0]?.directoryName ?? null;
+    }
+    renderProfiles();
+    toast(message, false);
+  } catch (error) {
+    toast(String(error), true);
+  } finally {
+    setBusy(false);
   }
 }
 
@@ -404,6 +503,7 @@ async function beginRename(profile: Profile, container: HTMLElement) {
     try {
       const report = await invoke<ProfileReport>("rename_profile", { profileDirectory: profile.directoryName, displayName: name });
       profiles = report.profiles;
+      archives = report.archives;
       renderProfiles();
       toast(`Renamed profile to ${name}.`, false);
     } catch (error) { toast(String(error), true); }
@@ -421,6 +521,7 @@ async function setDefault(profile: Profile) {
   try {
     const report = await invoke<ProfileReport>("set_default_profile", { profileDirectory: profile.directoryName });
     profiles = report.profiles;
+    archives = report.archives;
     selectedProfile = profile.directoryName;
     renderProfiles();
     toast(`${profile.displayName} will sync automatically when you sign in.`, false);
@@ -435,6 +536,7 @@ async function setAutoSync(profile: Profile, enabled: boolean) {
       enabled,
     });
     profiles = report.profiles;
+    archives = report.archives;
     renderProfiles();
     toast(`Automatic sync ${enabled ? "enabled" : "disabled"} for ${profile.displayName}.`, false);
   } catch (error) {
@@ -576,5 +678,44 @@ function toast(message: string, isError: boolean) {
   toastTimer = window.setTimeout(() => element.className = "", 6000);
 }
 
+function clearToast() {
+  window.clearTimeout(toastTimer);
+  const element = byId("toast");
+  element.textContent = "";
+  element.className = "";
+}
+
+async function restoreConnectionSettings() {
+  try {
+    const saved = await invoke<SavedConnection | null>("load_connection_settings");
+    if (!saved) return;
+    if (saved.transport === "https") {
+      setMode("https");
+      byId<HTMLInputElement>("https-url").value = saved.settings.url;
+      byId<HTMLInputElement>("https-port").value = String(saved.settings.port);
+      byId<HTMLInputElement>("https-token").value = saved.settings.apiToken;
+      byId<HTMLSelectElement>("certificate-mode").value = saved.settings.certificateMode;
+      byId<HTMLInputElement>("certificate-path").value = saved.settings.certificatePath ?? "";
+      byId<HTMLInputElement>("spki-pin").value = saved.settings.spkiPin ?? "";
+      byId<HTMLInputElement>("https-device").value = saved.settings.deviceName;
+      updateCertificateFields();
+    } else {
+      setMode("ssh");
+      byId<HTMLInputElement>("ssh-host").value = saved.settings.host;
+      byId<HTMLInputElement>("ssh-port").value = String(saved.settings.port);
+      byId<HTMLInputElement>("ssh-username").value = saved.settings.username;
+      byId<HTMLInputElement>("ssh-key").value = saved.settings.privateKey;
+      byId<HTMLInputElement>("ssh-passphrase").value = saved.settings.privateKeyPassphrase ?? "";
+      byId<HTMLInputElement>("ssh-socket").value = saved.settings.remoteSocket;
+      byId<HTMLInputElement>("ssh-token").value = saved.settings.apiToken;
+      byId<HTMLInputElement>("ssh-fingerprint").value = saved.settings.trustedFingerprint ?? "";
+      byId<HTMLInputElement>("ssh-device").value = saved.settings.deviceName;
+    }
+  } catch (error) {
+    toast(String(error), true);
+  }
+}
+
+void restoreConnectionSettings();
 void discover();
 window.setInterval(() => void runAutomaticSync(), AUTOMATIC_SYNC_INTERVAL_MS);
