@@ -406,13 +406,8 @@ jobs:
             exit 1
           fi
           if ! command -v git >/dev/null 2>&1; then
-            if command -v sudo >/dev/null 2>&1; then
-              sudo apt-get update
-              sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates git
-            else
-              apt-get update
-              DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates git
-            fi
+            echo "git is required on the macOS runner." >&2
+            exit 1
           fi
           git init .
           git remote remove origin 2>/dev/null || true
@@ -444,6 +439,22 @@ jobs:
           (cd "$RUNNER_TEMP"; grep "  ${node_archive}$" SHASUMS256.txt | shasum -a 256 --check)
           tar -xzf "$RUNNER_TEMP/$node_archive" --strip-components=1 -C "$tool_root"
           printf '%s\n' "$tool_root/bin" >> "$GITHUB_PATH"
+
+          # Forgejo runners launched as macOS services may not inherit the
+          # interactive shell PATH, so locate Homebrew explicitly.
+          if command -v brew >/dev/null 2>&1; then
+            brew_bin="$(dirname "$(command -v brew)")"
+          elif [[ -x /opt/homebrew/bin/brew ]]; then
+            brew_bin=/opt/homebrew/bin
+          elif [[ -x /usr/local/bin/brew ]]; then
+            brew_bin=/usr/local/bin
+          else
+            echo "Homebrew is required on the macOS runner but was not found." >&2
+            exit 1
+          fi
+
+          export PATH="$brew_bin:$PATH"
+          printf '%s\n' "$brew_bin" >> "$GITHUB_PATH"
 
           if ! command -v zstd >/dev/null 2>&1; then
             brew install zstd
