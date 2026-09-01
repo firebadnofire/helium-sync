@@ -3,12 +3,13 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, OpenOptions},
-    io::Write as _,
+    io::{Read, Seek, Write},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -45,6 +46,10 @@ pub enum ProfileError {
     },
     #[error("bookmark snapshots cannot be merged: {0}")]
     IncompatibleSnapshot(String),
+    #[error("invalid profile name: {0}")]
+    InvalidProfileName(String),
+    #[error("extension archive is invalid: {0}")]
+    InvalidExtensionArchive(String),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -134,6 +139,40 @@ pub struct BookmarkMergeResult {
     pub snapshot: BookmarkSnapshotV1,
     pub conflicts: u64,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExtensionBundleStats {
+    pub extensions: u64,
+    pub files: u64,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExtensionBundleDescriptor {
+    pub format: String,
+    pub profile_directory: String,
+    pub archive_sha256: String,
+    pub archive_bytes: u64,
+    pub stats: ExtensionBundleStats,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ExtensionRestoreResult {
+    pub backup_path: PathBuf,
+    pub stats: ExtensionBundleStats,
+}
+
+const EXTENSION_BUNDLE_FORMAT: &str = "helium-extensions-v1";
+const EXTENSION_DIRECTORIES: &[&str] = &[
+    "Extensions",
+    "Extension State",
+    "Local Extension Settings",
+    "Sync Extension Settings",
+    "Managed Extension Settings",
+    "Extension Rules",
+    "Extension Scripts",
+];
+const EXTENSION_PREFERENCE_FILES: &[&str] = &["Preferences", "Secure Preferences"];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -301,6 +340,43 @@ pub fn enumerate_profiles(user_data_dir: &Path) -> Result<Vec<DiscoveredProfile>
     Ok(profiles)
 }
 
+/// Reserves the next Chromium-style profile directory without editing `Local State`.
+///
+/// Helium will initialize and register the directory when it is first launched with the matching
+/// `--profile-directory` argument. The create-new operation makes collisions visible rather than
+/// reusing an existing profile after a concurrent request.
+pub fn create_profile(user_data_dir: &Path) -> Result<DiscoveredProfile, ProfileError> {
+    if !user_data_dir.is_dir() {
+        return Err(ProfileError::Read {
+            path: user_data_dir.to_path_buf(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "Helium user-data directory does not exist",
+            ),
+        });
+    }
+    for number in 1_u32..=u32::MAX {
+        let directory_name = format!("Profile {number}");
+        let path = user_data_dir.join(&directory_name);
+        match fs::create_dir(&path) {
+            Ok(()) => {
+                return Ok(DiscoveredProfile {
+                    directory_name: directory_name.clone(),
+                    display_name: directory_name,
+                    bookmarks_path: path.join("Bookmarks"),
+                    path,
+                    bookmark_status: BookmarkStatus::Missing,
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(source) => return Err(ProfileError::Write { path, source }),
+        }
+    }
+    Err(ProfileError::InvalidProfileName(
+        "no available Profile N directory remains".to_owned(),
+    ))
+}
+
 /// Reads and canonicalizes one Chromium-format `Bookmarks` file.
 ///
 /// The file is read once per attempt and retried once when its metadata changes during the read.
@@ -458,6 +534,227 @@ pub fn merge_bookmarks(
         },
         conflicts,
     })
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ExtensionArchiveMetadata {
+    format: String,
+    profile_directory: String,
+    stats: ExtensionBundleStats,
+}
+
+/// Writes a deterministic Zstandard ZIP containing installed extensions and extension-owned data.
+///
+/// Symbolic links are rejected so a profile cannot cause files outside its directory to be copied.
+/// Only the `extensions` section is captured from Chromium preference files.
+pub fn create_extension_bundle(
+    profile: &DiscoveredProfile,
+    destination: &Path,
+) -> Result<ExtensionBundleDescriptor, ProfileError> {
+    let parent = destination.parent().ok_or_else(|| {
+        ProfileError::InvalidExtensionArchive("archive destination has no parent".to_owned())
+    })?;
+    fs::create_dir_all(parent).map_err(|source| ProfileError::Write {
+        path: parent.to_path_buf(),
+        source,
+    })?;
+    let archive_file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(destination)
+        .map_err(|error| ProfileError::Archive {
+            path: destination.to_path_buf(),
+            details: error.to_string(),
+        })?;
+    let mut archive = zip::ZipWriter::new(archive_file);
+    let file_options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Zstd)
+        .unix_permissions(0o600);
+    let directory_options = file_options.unix_permissions(0o700);
+    let mut stats = ExtensionBundleStats {
+        extensions: count_extensions(&profile.path)?,
+        files: 0,
+        bytes: 0,
+    };
+
+    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        for directory in EXTENSION_DIRECTORIES {
+            add_extension_tree(
+                &mut archive,
+                &profile.path,
+                &profile.path.join(directory),
+                file_options,
+                directory_options,
+                &mut stats,
+            )?;
+        }
+        let indexed_db = profile.path.join("IndexedDB");
+        if indexed_db.is_dir() {
+            let mut entries = fs::read_dir(&indexed_db)?.collect::<Result<Vec<_>, _>>()?;
+            entries.sort_by_key(fs::DirEntry::file_name);
+            for entry in entries {
+                if entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("chrome-extension_")
+                {
+                    add_extension_tree(
+                        &mut archive,
+                        &profile.path,
+                        &entry.path(),
+                        file_options,
+                        directory_options,
+                        &mut stats,
+                    )?;
+                }
+            }
+        }
+        for file_name in EXTENSION_PREFERENCE_FILES {
+            let section = read_extension_preferences(&profile.path.join(file_name))?;
+            archive.start_file(
+                format!("preferences/{file_name}.extensions.json"),
+                file_options,
+            )?;
+            archive.write_all(&serde_json::to_vec(&section)?)?;
+        }
+        let metadata = ExtensionArchiveMetadata {
+            format: EXTENSION_BUNDLE_FORMAT.to_owned(),
+            profile_directory: profile.directory_name.clone(),
+            stats: stats.clone(),
+        };
+        archive.start_file("manifest.json", file_options)?;
+        archive.write_all(&serde_json::to_vec(&metadata)?)?;
+        archive.finish()?.sync_all()?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let _cleanup_result = fs::remove_file(destination);
+        return Err(ProfileError::Archive {
+            path: destination.to_path_buf(),
+            details: error.to_string(),
+        });
+    }
+
+    let (archive_sha256, archive_bytes) = sha256_file(destination)?;
+    Ok(ExtensionBundleDescriptor {
+        format: EXTENSION_BUNDLE_FORMAT.to_owned(),
+        profile_directory: profile.directory_name.clone(),
+        archive_sha256,
+        archive_bytes,
+        stats,
+    })
+}
+
+fn count_extensions(profile_path: &Path) -> Result<u64, ProfileError> {
+    let extensions = profile_path.join("Extensions");
+    if !extensions.is_dir() {
+        return Ok(0);
+    }
+    let mut count = 0_u64;
+    for entry in fs::read_dir(&extensions).map_err(|source| ProfileError::Read {
+        path: extensions.clone(),
+        source,
+    })? {
+        let entry = entry.map_err(|source| ProfileError::Read {
+            path: extensions.clone(),
+            source,
+        })?;
+        if entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+            count = count.saturating_add(1);
+        }
+    }
+    Ok(count)
+}
+
+fn add_extension_tree<W: Write + Seek>(
+    archive: &mut zip::ZipWriter<W>,
+    profile_path: &Path,
+    path: &Path,
+    file_options: zip::write::SimpleFileOptions,
+    directory_options: zip::write::SimpleFileOptions,
+    stats: &mut ExtensionBundleStats,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!("symbolic link is not allowed: {}", path.display()).into());
+    }
+    let relative = path.strip_prefix(profile_path)?;
+    let entry_name = format!("payload/{}", zip_path(relative));
+    if metadata.is_dir() {
+        archive.add_directory(format!("{entry_name}/"), directory_options)?;
+        let mut entries = fs::read_dir(path)?.collect::<Result<Vec<_>, _>>()?;
+        entries.sort_by_key(fs::DirEntry::file_name);
+        for entry in entries {
+            add_extension_tree(
+                archive,
+                profile_path,
+                &entry.path(),
+                file_options,
+                directory_options,
+                stats,
+            )?;
+        }
+    } else if metadata.is_file() {
+        archive.start_file(entry_name, file_options)?;
+        let mut source = fs::File::open(path)?;
+        std::io::copy(&mut source, archive)?;
+        stats.files = stats.files.saturating_add(1);
+        stats.bytes = stats.bytes.saturating_add(metadata.len());
+    }
+    Ok(())
+}
+
+fn zip_path(path: &Path) -> String {
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn read_extension_preferences(path: &Path) -> Result<serde_json::Value, ProfileError> {
+    if !path.is_file() {
+        return Ok(serde_json::Value::Null);
+    }
+    let bytes = fs::read(path).map_err(|source| ProfileError::Read {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let value: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|source| ProfileError::Parse {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    Ok(value
+        .get("extensions")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null))
+}
+
+fn sha256_file(path: &Path) -> Result<(String, u64), ProfileError> {
+    let mut file = fs::File::open(path).map_err(|source| ProfileError::Read {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut digest = Sha256::new();
+    let mut bytes = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|source| ProfileError::Read {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+        bytes = bytes.saturating_add(read as u64);
+    }
+    Ok((format!("{:x}", digest.finalize()), bytes))
 }
 
 fn validate_merge_pair(
@@ -682,6 +979,377 @@ fn merge_value<T: Clone + PartialEq>(
     }
     *conflicts += 1;
     remote.clone()
+}
+
+/// Restores an extension bundle after validating it and backing up current extension state.
+pub fn restore_extension_bundle(
+    profile: &DiscoveredProfile,
+    archive_path: &Path,
+    downloads_dir: &Path,
+) -> Result<ExtensionRestoreResult, ProfileError> {
+    let archive_file = fs::File::open(archive_path).map_err(|source| ProfileError::Read {
+        path: archive_path.to_path_buf(),
+        source,
+    })?;
+    let mut archive = zip::ZipArchive::new(archive_file).map_err(|error| {
+        ProfileError::InvalidExtensionArchive(format!("could not open ZIP: {error}"))
+    })?;
+    let metadata: ExtensionArchiveMetadata = {
+        let mut entry = archive.by_name("manifest.json").map_err(|error| {
+            ProfileError::InvalidExtensionArchive(format!("manifest is missing: {error}"))
+        })?;
+        let mut bytes = Vec::new();
+        entry.read_to_end(&mut bytes).map_err(|error| {
+            ProfileError::InvalidExtensionArchive(format!("could not read manifest: {error}"))
+        })?;
+        serde_json::from_slice(&bytes).map_err(|error| {
+            ProfileError::InvalidExtensionArchive(format!("manifest is invalid: {error}"))
+        })?
+    };
+    if metadata.format != EXTENSION_BUNDLE_FORMAT {
+        return Err(ProfileError::InvalidExtensionArchive(format!(
+            "unsupported format {}",
+            metadata.format
+        )));
+    }
+    if metadata.profile_directory != profile.directory_name {
+        return Err(ProfileError::ProfileMismatch {
+            snapshot_profile: metadata.profile_directory,
+            selected_profile: profile.directory_name.clone(),
+        });
+    }
+
+    let stage = tempfile::Builder::new()
+        .prefix(".helium-sync-extension-stage-")
+        .tempdir_in(&profile.path)
+        .map_err(|source| ProfileError::Write {
+            path: profile.path.clone(),
+            source,
+        })?;
+    let staged_profile = stage.path().join("profile");
+    fs::create_dir(&staged_profile).map_err(|source| ProfileError::Write {
+        path: staged_profile.clone(),
+        source,
+    })?;
+    extract_extension_payload(&mut archive, &staged_profile)?;
+    stage_preference_files(&mut archive, &profile.path, &staged_profile)?;
+
+    fs::create_dir_all(downloads_dir).map_err(|source| ProfileError::Write {
+        path: downloads_dir.to_path_buf(),
+        source,
+    })?;
+    let unique = unique_suffix();
+    let backup_path = downloads_dir.join(format!(
+        "Helium-Sync-{}-extensions-before-load-{unique}.zip",
+        safe_profile_name(&profile.directory_name)
+    ));
+    create_extension_bundle(profile, &backup_path)?;
+
+    let rollback = tempfile::Builder::new()
+        .prefix(".helium-sync-extension-rollback-")
+        .tempdir_in(&profile.path)
+        .map_err(|source| ProfileError::Write {
+            path: profile.path.clone(),
+            source,
+        })?;
+    let targets = extension_restore_targets(&profile.path, &staged_profile)?;
+    let mut moved_old = Vec::new();
+    for relative in &targets {
+        let live = profile.path.join(relative);
+        if !live.exists() {
+            continue;
+        }
+        let previous = rollback.path().join(relative);
+        if let Some(parent) = previous.parent() {
+            fs::create_dir_all(parent).map_err(|source| ProfileError::Write {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+        if let Err(source) = fs::rename(&live, &previous) {
+            let rollback_errors =
+                rollback_extension_targets(&profile.path, rollback.path(), &moved_old, &[]);
+            return Err(ProfileError::Archive {
+                path: live,
+                details: format!(
+                    "could not stage existing extension data ({source}); {}; backup: {}",
+                    rollback_summary(&rollback_errors),
+                    backup_path.display()
+                ),
+            });
+        }
+        moved_old.push(relative.clone());
+    }
+
+    let mut installed = Vec::new();
+    for relative in &targets {
+        let staged = staged_profile.join(relative);
+        if !staged.exists() {
+            continue;
+        }
+        let live = profile.path.join(relative);
+        if let Some(parent) = live.parent()
+            && let Err(source) = fs::create_dir_all(parent)
+        {
+            let rollback_errors =
+                rollback_extension_targets(&profile.path, rollback.path(), &moved_old, &installed);
+            return Err(ProfileError::Archive {
+                path: parent.to_path_buf(),
+                details: format!(
+                    "could not prepare extension destination ({source}); {}; backup: {}",
+                    rollback_summary(&rollback_errors),
+                    backup_path.display()
+                ),
+            });
+        }
+        if let Err(source) = fs::rename(&staged, &live) {
+            let rollback_errors =
+                rollback_extension_targets(&profile.path, rollback.path(), &moved_old, &installed);
+            return Err(ProfileError::Archive {
+                path: live,
+                details: format!(
+                    "extension replacement failed ({source}); {}; backup: {}",
+                    rollback_summary(&rollback_errors),
+                    backup_path.display()
+                ),
+            });
+        }
+        installed.push(relative.clone());
+    }
+
+    Ok(ExtensionRestoreResult {
+        backup_path,
+        stats: metadata.stats,
+    })
+}
+
+fn extract_extension_payload<R: Read + Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    staged_profile: &Path,
+) -> Result<(), ProfileError> {
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).map_err(|error| {
+            ProfileError::InvalidExtensionArchive(format!("could not read entry: {error}"))
+        })?;
+        let Some(enclosed) = entry.enclosed_name() else {
+            return Err(ProfileError::InvalidExtensionArchive(format!(
+                "unsafe path {}",
+                entry.name()
+            )));
+        };
+        let Ok(relative) = enclosed.strip_prefix("payload") else {
+            continue;
+        };
+        if relative.as_os_str().is_empty() {
+            continue;
+        }
+        validate_extension_relative_path(relative)?;
+        let destination = staged_profile.join(relative);
+        if entry.is_dir() {
+            fs::create_dir_all(&destination).map_err(|source| ProfileError::Write {
+                path: destination,
+                source,
+            })?;
+        } else {
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent).map_err(|source| ProfileError::Write {
+                    path: parent.to_path_buf(),
+                    source,
+                })?;
+            }
+            let mut output = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&destination)
+                .map_err(|source| ProfileError::Write {
+                    path: destination.clone(),
+                    source,
+                })?;
+            std::io::copy(&mut entry, &mut output).map_err(|source| ProfileError::Write {
+                path: destination,
+                source,
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_extension_relative_path(path: &Path) -> Result<(), ProfileError> {
+    let mut components = path.components();
+    let first = components
+        .next()
+        .map(|component| component.as_os_str().to_string_lossy().into_owned())
+        .ok_or_else(|| ProfileError::InvalidExtensionArchive("empty payload path".to_owned()))?;
+    if EXTENSION_DIRECTORIES.contains(&first.as_str()) {
+        return Ok(());
+    }
+    if first == "IndexedDB" {
+        let child = components
+            .next()
+            .map(|component| component.as_os_str().to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if child.starts_with("chrome-extension_") {
+            return Ok(());
+        }
+    }
+    Err(ProfileError::InvalidExtensionArchive(format!(
+        "payload path is outside the extension allowlist: {}",
+        path.display()
+    )))
+}
+
+fn stage_preference_files<R: Read + Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    live_profile: &Path,
+    staged_profile: &Path,
+) -> Result<(), ProfileError> {
+    for file_name in EXTENSION_PREFERENCE_FILES {
+        let entry_name = format!("preferences/{file_name}.extensions.json");
+        let section: serde_json::Value = {
+            let mut entry = archive.by_name(&entry_name).map_err(|error| {
+                ProfileError::InvalidExtensionArchive(format!("{entry_name} is missing: {error}"))
+            })?;
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes).map_err(|error| {
+                ProfileError::InvalidExtensionArchive(format!(
+                    "could not read {entry_name}: {error}"
+                ))
+            })?;
+            serde_json::from_slice(&bytes).map_err(|error| {
+                ProfileError::InvalidExtensionArchive(format!("{entry_name} is invalid: {error}"))
+            })?
+        };
+        let live = live_profile.join(file_name);
+        if !live.exists() && section.is_null() {
+            continue;
+        }
+        let mut preferences = if live.is_file() {
+            let bytes = fs::read(&live).map_err(|source| ProfileError::Read {
+                path: live.clone(),
+                source,
+            })?;
+            serde_json::from_slice::<serde_json::Value>(&bytes).map_err(|source| {
+                ProfileError::Parse {
+                    path: live.clone(),
+                    source,
+                }
+            })?
+        } else {
+            serde_json::json!({})
+        };
+        let object = preferences.as_object_mut().ok_or_else(|| {
+            ProfileError::InvalidExtensionArchive(format!(
+                "{} is not a JSON object",
+                live.display()
+            ))
+        })?;
+        if section.is_null() {
+            object.remove("extensions");
+        } else {
+            object.insert("extensions".to_owned(), section);
+        }
+        let staged = staged_profile.join(file_name);
+        let bytes =
+            serde_json::to_vec_pretty(&preferences).map_err(|source| ProfileError::Parse {
+                path: staged.clone(),
+                source,
+            })?;
+        fs::write(&staged, bytes).map_err(|source| ProfileError::Write {
+            path: staged,
+            source,
+        })?;
+    }
+    Ok(())
+}
+
+fn extension_restore_targets(
+    live_profile: &Path,
+    staged_profile: &Path,
+) -> Result<Vec<PathBuf>, ProfileError> {
+    let mut targets = EXTENSION_DIRECTORIES
+        .iter()
+        .map(PathBuf::from)
+        .collect::<BTreeSet<_>>();
+    for root in [live_profile, staged_profile] {
+        let indexed_db = root.join("IndexedDB");
+        if !indexed_db.is_dir() {
+            continue;
+        }
+        for entry in fs::read_dir(&indexed_db).map_err(|source| ProfileError::Read {
+            path: indexed_db.clone(),
+            source,
+        })? {
+            let entry = entry.map_err(|source| ProfileError::Read {
+                path: indexed_db.clone(),
+                source,
+            })?;
+            let name = entry.file_name();
+            if name.to_string_lossy().starts_with("chrome-extension_") {
+                targets.insert(PathBuf::from("IndexedDB").join(name));
+            }
+        }
+    }
+    targets.extend(EXTENSION_PREFERENCE_FILES.iter().map(PathBuf::from));
+    Ok(targets.into_iter().collect())
+}
+
+fn rollback_extension_targets(
+    profile_path: &Path,
+    rollback_path: &Path,
+    moved_old: &[PathBuf],
+    installed: &[PathBuf],
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    for relative in installed.iter().rev() {
+        let live = profile_path.join(relative);
+        let result = if live.is_dir() {
+            fs::remove_dir_all(&live)
+        } else {
+            fs::remove_file(&live)
+        };
+        if let Err(error) = result {
+            errors.push(format!("could not remove {}: {error}", live.display()));
+        }
+    }
+    for relative in moved_old.iter().rev() {
+        let previous = rollback_path.join(relative);
+        let live = profile_path.join(relative);
+        if let Some(parent) = live.parent()
+            && let Err(error) = fs::create_dir_all(parent)
+        {
+            errors.push(format!("could not recreate {}: {error}", parent.display()));
+            continue;
+        }
+        if let Err(error) = fs::rename(&previous, &live) {
+            errors.push(format!(
+                "could not restore {} to {}: {error}",
+                previous.display(),
+                live.display()
+            ));
+        }
+    }
+    errors
+}
+
+fn rollback_summary(errors: &[String]) -> String {
+    if errors.is_empty() {
+        "the original extension data was restored".to_owned()
+    } else {
+        format!("rollback also reported: {}", errors.join("; "))
+    }
+}
+
+fn safe_profile_name(profile_directory: &str) -> String {
+    profile_directory
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 /// Restores a bookmark snapshot after archiving the current local file in `downloads_dir`.
@@ -969,13 +1637,45 @@ fn platform_candidates(executable_override: Option<&Path>) -> Vec<HeliumInstalla
     #[cfg(target_os = "linux")]
     if let Some(base) = directories::BaseDirs::new() {
         push(
-            None,
+            linux_helium_executable(),
             base.config_dir().join("net.imput.helium"),
             DiscoverySource::StandardPath,
         );
     }
 
     candidates
+}
+
+#[cfg(target_os = "linux")]
+fn linux_helium_executable() -> Option<PathBuf> {
+    std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+        .and_then(|paths| find_executable_in_paths("helium", paths))
+        .or_else(|| {
+            ["/usr/bin/helium", "/usr/local/bin/helium"]
+                .into_iter()
+                .map(PathBuf::from)
+                .find(|path| is_executable_file(path))
+        })
+}
+
+#[cfg(target_os = "linux")]
+fn find_executable_in_paths(
+    name: &str,
+    paths: impl IntoIterator<Item = PathBuf>,
+) -> Option<PathBuf> {
+    paths
+        .into_iter()
+        .map(|path| path.join(name))
+        .find(|path| is_executable_file(path))
+}
+
+#[cfg(target_os = "linux")]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    path.metadata()
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
 }
 
 #[cfg(windows)]
@@ -1019,7 +1719,6 @@ fn windows_registry_candidates() -> Vec<(PathBuf, PathBuf)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Read as _;
 
     const BOOKMARKS: &str = r#"{
       "version": 1,
@@ -1064,6 +1763,24 @@ mod tests {
             BookmarkNode::Folder { children, .. } => children,
             BookmarkNode::Url { .. } => panic!("expected bookmark-bar folder"),
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn finds_executable_helium_launcher_on_path() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let launcher = temp.path().join("helium");
+        fs::write(&launcher, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut permissions = fs::metadata(&launcher).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&launcher, permissions).unwrap();
+
+        assert_eq!(
+            find_executable_in_paths("helium", [temp.path().to_path_buf()]),
+            Some(launcher)
+        );
     }
 
     #[test]
@@ -1161,6 +1878,100 @@ mod tests {
         );
         archived_bookmarks.read_to_string(&mut original).unwrap();
         assert_eq!(original, BOOKMARKS);
+    }
+
+    #[test]
+    fn creates_next_profile_without_reusing_existing_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join("Default")).unwrap();
+        fs::create_dir(temp.path().join("Profile 1")).unwrap();
+
+        let created = create_profile(temp.path()).unwrap();
+
+        assert_eq!(created.directory_name, "Profile 2");
+        assert!(created.path.is_dir());
+        assert_eq!(created.bookmark_status, BookmarkStatus::Missing);
+    }
+
+    #[test]
+    fn extension_bundle_is_deterministic_and_restores_only_extension_data() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile_path = temp.path().join("Default");
+        let downloads = temp.path().join("Downloads");
+        fs::create_dir_all(profile_path.join("Extensions/abc/1.0")).unwrap();
+        fs::write(
+            profile_path.join("Extensions/abc/1.0/manifest.json"),
+            br#"{"name":"Example"}"#,
+        )
+        .unwrap();
+        fs::create_dir_all(profile_path.join("IndexedDB/chrome-extension_abc_0.indexeddb.leveldb"))
+            .unwrap();
+        fs::write(
+            profile_path.join("IndexedDB/chrome-extension_abc_0.indexeddb.leveldb/000001.ldb"),
+            b"extension-state",
+        )
+        .unwrap();
+        fs::create_dir_all(profile_path.join("IndexedDB/https_example.test_0.indexeddb.leveldb"))
+            .unwrap();
+        fs::write(
+            profile_path.join("IndexedDB/https_example.test_0.indexeddb.leveldb/000001.ldb"),
+            b"website-state",
+        )
+        .unwrap();
+        fs::write(
+            profile_path.join("Preferences"),
+            br#"{"homepage":"https://local.test","extensions":{"settings":{"abc":{"state":1}}}}"#,
+        )
+        .unwrap();
+        fs::write(
+            profile_path.join("Secure Preferences"),
+            br#"{"extensions":{}}"#,
+        )
+        .unwrap();
+        let profile = DiscoveredProfile {
+            directory_name: "Default".to_owned(),
+            display_name: "You".to_owned(),
+            path: profile_path.clone(),
+            bookmarks_path: profile_path.join("Bookmarks"),
+            bookmark_status: BookmarkStatus::Missing,
+        };
+        let first = temp.path().join("first.zip");
+        let second = temp.path().join("second.zip");
+        let first_descriptor = create_extension_bundle(&profile, &first).unwrap();
+        let second_descriptor = create_extension_bundle(&profile, &second).unwrap();
+        assert_eq!(
+            first_descriptor.archive_sha256,
+            second_descriptor.archive_sha256
+        );
+        assert_eq!(first_descriptor.stats.extensions, 1);
+        assert_eq!(first_descriptor.stats.files, 2);
+
+        fs::remove_dir_all(profile_path.join("Extensions")).unwrap();
+        fs::create_dir_all(profile_path.join("Extensions/other/1.0")).unwrap();
+        fs::write(
+            profile_path.join("Preferences"),
+            br#"{"homepage":"https://preserved.test","extensions":{"settings":{}}}"#,
+        )
+        .unwrap();
+
+        let restored = restore_extension_bundle(&profile, &first, &downloads).unwrap();
+        assert_eq!(restored.stats.extensions, 1);
+        assert!(restored.backup_path.is_file());
+        assert!(
+            profile_path
+                .join("Extensions/abc/1.0/manifest.json")
+                .is_file()
+        );
+        assert!(!profile_path.join("Extensions/other").exists());
+        assert!(
+            profile_path
+                .join("IndexedDB/https_example.test_0.indexeddb.leveldb/000001.ldb")
+                .is_file()
+        );
+        let preferences: serde_json::Value =
+            serde_json::from_slice(&fs::read(profile_path.join("Preferences")).unwrap()).unwrap();
+        assert_eq!(preferences["homepage"], "https://preserved.test");
+        assert_eq!(preferences["extensions"]["settings"]["abc"]["state"], 1);
     }
 
     #[test]

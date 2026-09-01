@@ -48,4 +48,6 @@ npm ci
 npm run tauri dev
 ```
 
-For the generated certificate, select custom CA and choose `server.crt`. Sign in, choose a default profile, and use **Sync now** or leave **Automatic** enabled. Import the first device's `hsync1:` recovery code on every additional trusted device. Close Helium when a device needs to apply server changes locally; a Zstandard-compressed ZIP backup is created in Downloads before replacement.
+For the generated certificate, select custom CA and choose `server.crt`. Close Helium, create or select a profile, choose a default, and use **Sync now** or leave **Automatic** enabled. Import the first device's `hsync1:` recovery code on every additional trusted device. **Launch** starts Helium with the selected profile directory. Keep Helium closed during every create, sync, restore, or switch operation; Zstandard-compressed ZIP backups are created in Downloads before local bookmark or extension replacement.
+
+Linux native packages expose the `helium` launcher on `PATH`. For an AppImage, extracted archive, or another nonstandard installation, set `HELIUM_SYNC_HELIUM_PATH` to the Helium executable before starting Helium Sync.

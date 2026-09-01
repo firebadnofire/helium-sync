@@ -4,6 +4,7 @@ import "./style.css";
 
 type BookmarkStatus = "missing" | "readable" | { invalid: string };
 type BookmarkStats = { bookmarks: number; folders: number; bytes: number };
+type ExtensionStats = { extensions: number; files: number; bytes: number };
 type Profile = {
   directoryName: string;
   displayName: string;
@@ -25,17 +26,20 @@ type SyncFeedback = {
   revision: number;
   conflicts: number;
   backupPath: string | null;
+  extensionStats: ExtensionStats | null;
+  extensionBackupPath: string | null;
   message: string;
 };
+type LaunchResult = { profileName: string; sync: SyncFeedback | null; message: string };
 type LoginResult = { diagnostics: DiagnosticReport; sync: SyncFeedback | null };
 
 const app = document.querySelector<HTMLDivElement>("#app")!;
 app.innerHTML = `
   <header>
     <div>
-      <p class="eyebrow">PRIVATE BOOKMARK SYNC</p>
+      <p class="eyebrow">PRIVATE PROFILE SYNC</p>
       <h1>Helium Sync</h1>
-      <p class="subtitle">Keep encrypted Helium bookmarks consistent across your devices.</p>
+      <p class="subtitle">Launch isolated Helium profiles with encrypted bookmarks, extensions, and extension data.</p>
     </div>
     <span id="connection-badge" class="badge idle">Signed out</span>
   </header>
@@ -49,9 +53,9 @@ app.innerHTML = `
     <section id="profiles" class="panel active">
       <div class="section-heading">
         <div><p class="eyebrow">LOCAL HELIUM</p><h2>Profiles</h2></div>
-        <button id="refresh-profiles" type="button">Refresh</button>
+        <div class="heading-actions"><button id="refresh-profiles" type="button">Refresh</button><button id="add-profile" class="primary" type="button">Add profile</button></div>
       </div>
-      <p class="muted profile-intro">Sync now or leave automatic sync enabled while this desktop client is open. Every local replacement is backed up first.</p>
+      <aside class="launcher-note"><strong>Switch with Helium closed.</strong><span>Launch opens exactly one selected profile. Sync reads and replacements include bookmarks, installed extensions, and extension-owned data; replacements are backed up first.</span></aside>
       <div id="profile-list" class="profile-list" aria-live="polite"></div>
       <section id="sync-feedback" class="feedback hidden" aria-live="polite"></section>
     </section>
@@ -66,7 +70,7 @@ app.innerHTML = `
       </div>
       <aside class="login-note">
         <strong>Sign in reconciles your default profile.</strong>
-        <span>Local and server changes are merged. If the local Bookmarks file changes, its previous version is first backed up with Zstandard compression in Downloads.</span>
+        <span>Bookmark changes are merged. Extension snapshots stop on concurrent edits rather than guessing. Every local replacement is first backed up with Zstandard compression in Downloads.</span>
       </aside>
 
       <form id="https-form" class="form-grid">
@@ -209,6 +213,33 @@ async function runLogin(command: string, input: unknown) {
 }
 
 byId("refresh-profiles").addEventListener("click", () => void discover());
+byId("add-profile").addEventListener("click", () => void addProfile());
+async function addProfile() {
+  const displayName = window.prompt("Name this Helium profile:", `Profile ${profiles.length + 1}`)?.trim();
+  if (!displayName) return;
+  const previous = new Set(profiles.map((profile) => profile.directoryName));
+  setBusy(true);
+  try {
+    const report = await invoke<ProfileReport>("create_browser_profile", { displayName });
+    profiles = report.profiles;
+    selectedProfile = profiles.find((profile) => !previous.has(profile.directoryName))?.directoryName
+      ?? selectedProfile;
+    renderProfiles();
+    toast(`Created ${displayName}. Click Launch to initialize it in Helium.`, false);
+  } catch (error) { toast(String(error), true); }
+  finally { setBusy(false); }
+}
+
+async function launch(profile: Profile) {
+  setBusy(true);
+  try {
+    const result = await invoke<LaunchResult>("launch_profile", { profileDirectory: profile.directoryName });
+    if (result.sync) renderFeedback(result.sync);
+    toast(result.message, false);
+  } catch (error) { toast(String(error), true); }
+  finally { setBusy(false); }
+}
+
 async function discover() {
   try {
     const report = await invoke<ProfileReport>("discover_profiles");
@@ -301,6 +332,12 @@ function renderProfiles(error?: string) {
 
     const actions = document.createElement("div");
     actions.className = "profile-actions";
+    const launchButton = document.createElement("button");
+    launchButton.type = "button";
+    launchButton.className = "primary launch-profile";
+    launchButton.textContent = "Launch";
+    launchButton.title = `Open Helium using only ${profile.displayName}`;
+    launchButton.addEventListener("click", () => void launch(profile));
     const makeDefault = document.createElement("button");
     makeDefault.type = "button";
     makeDefault.textContent = profile.isDefault ? "Default" : "Use at sign-in";
@@ -315,9 +352,8 @@ function renderProfiles(error?: string) {
     autoSync.append(autoSyncCheckbox, document.createTextNode("Automatic"));
     const sync = document.createElement("button");
     sync.type = "button";
-    sync.className = "primary";
     sync.textContent = "Sync now";
-    sync.title = "Reconcile local and server bookmarks without discarding independent changes";
+    sync.title = "Reconcile bookmarks, extensions, and extension data while Helium is closed";
     sync.disabled = !connected || !readable || syncInProgress.has(profile.directoryName);
     sync.addEventListener("click", () => void runProfileAction("sync_profile", profile));
     const recovery = document.createElement("details");
@@ -327,17 +363,17 @@ function renderProfiles(error?: string) {
     const save = document.createElement("button");
     save.type = "button";
     save.textContent = "Replace server copy";
-    save.title = "Recovery action: replace the server copy with current local bookmarks";
+    save.title = "Recovery action: replace the server copy with current bookmarks, extensions, and extension data";
     save.disabled = !connected || !readable;
     save.addEventListener("click", () => void runProfileAction("save_profile", profile));
     const load = document.createElement("button");
     load.type = "button";
     load.textContent = "Restore server copy";
-    load.title = "Recovery action: back up local bookmarks, then replace them with the server copy";
+    load.title = "Recovery action: back up local profile data, then restore bookmarks and extensions from the server";
     load.disabled = !connected || !profile.hasSavedCopy;
     load.addEventListener("click", () => void confirmLoad(profile));
     recovery.append(recoverySummary, save, load);
-    actions.append(makeDefault, autoSync, sync, recovery);
+    actions.append(launchButton, sync, makeDefault, autoSync, recovery);
 
     card.append(selector, identity, stats, actions);
     list.append(card);
@@ -409,7 +445,7 @@ async function setAutoSync(profile: Profile, enabled: boolean) {
 
 function confirmLoad(profile: Profile) {
   const confirmed = window.confirm(
-    `Load the saved copy into ${profile.displayName}?\n\nThe current local Bookmarks file will first be backed up as a ZIP in Downloads. Close Helium before continuing so it cannot overwrite the restored file.`,
+    `Load the saved copy into ${profile.displayName}?\n\nCurrent bookmarks, installed extensions, and extension data will first be backed up as Zstandard ZIPs in Downloads. Close every Helium window before continuing.`,
   );
   if (confirmed) void runProfileAction("load_profile", profile);
 }
@@ -427,7 +463,7 @@ async function runProfileAction(
     renderFeedback(feedback);
     await discover();
     if (!background) toast(feedback.message, false);
-  } catch (error) { toast(String(error), true); }
+  } catch (error) { if (!background) toast(String(error), true); }
   finally {
     syncInProgress.delete(profile.directoryName);
     if (!background) setBusy(false);
@@ -455,10 +491,21 @@ function renderFeedback(feedback: SyncFeedback) {
   const summary = document.createElement("span");
   summary.textContent = `${feedback.stats.bookmarks.toLocaleString()} bookmarks · ${feedback.stats.folders.toLocaleString()} folders · ${formatBytes(feedback.stats.bytes)}`;
   panel.append(title, summary);
+  if (feedback.extensionStats) {
+    const extensions = document.createElement("span");
+    extensions.textContent = `${feedback.extensionStats.extensions.toLocaleString()} extensions · ${feedback.extensionStats.files.toLocaleString()} extension files · ${formatBytes(feedback.extensionStats.bytes)}`;
+    panel.append(extensions);
+  }
   if (feedback.backupPath) {
     const backup = document.createElement("span");
     backup.className = "backup-path";
     backup.textContent = `Local backup: ${feedback.backupPath}`;
+    panel.append(backup);
+  }
+  if (feedback.extensionBackupPath) {
+    const backup = document.createElement("span");
+    backup.className = "backup-path";
+    backup.textContent = `Extension backup: ${feedback.extensionBackupPath}`;
     panel.append(backup);
   }
   panel.classList.remove("hidden");

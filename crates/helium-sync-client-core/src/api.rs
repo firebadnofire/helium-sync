@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
 use helium_sync_common::{
-    ApiErrorBody, ChangesResponse, Device, ObjectId, PROTOCOL_HEADER, PROTOCOL_MAX, PROTOCOL_MIN,
-    ProtocolRange, ProtocolVersion, PutObjectRequest, RegisterDeviceRequest, StatusResponse,
-    SyncObject, VersionResponse,
+    ApiErrorBody, ChangesResponse, DeleteObjectRequest, Device, ObjectId, PROTOCOL_HEADER,
+    PROTOCOL_MAX, PROTOCOL_MIN, ProtocolRange, ProtocolVersion, PutObjectRequest,
+    RegisterDeviceRequest, StatusResponse, SyncObject, VersionResponse,
 };
 use http::{
     HeaderMap, HeaderValue, Method,
@@ -89,6 +89,21 @@ impl ApiClient {
         self.ensure_negotiated().await?;
         self.json_request::<(), _>(Method::GET, &format!("/v1/objects/{id}"), None, true)
             .await
+    }
+
+    pub async fn delete_object(
+        &self,
+        id: ObjectId,
+        request: &DeleteObjectRequest,
+    ) -> Result<SyncObject, ClientError> {
+        self.ensure_negotiated().await?;
+        self.json_request(
+            Method::DELETE,
+            &format!("/v1/objects/{id}"),
+            Some(request),
+            true,
+        )
+        .await
     }
 
     pub async fn changes(&self, after: u64) -> Result<ChangesResponse, ClientError> {

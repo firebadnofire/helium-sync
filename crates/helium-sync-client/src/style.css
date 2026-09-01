@@ -46,6 +46,7 @@ nav { display: flex; gap: 5px; border-bottom: 1px solid var(--line); margin-bott
 }
 .panel.active { display: block; }
 .section-heading { display: flex; justify-content: space-between; align-items: center; gap: 18px; margin-bottom: 14px; }
+.heading-actions { display: flex; gap: 8px; }
 
 button { border: 1px solid #3b554e; border-radius: 9px; background: #182822; padding: 9px 13px; }
 button:hover:not(:disabled) { border-color: #67837a; background: #1c3029; }
@@ -54,7 +55,8 @@ button.primary:hover:not(:disabled) { background: #81ecc6; }
 .text-button { border: 0; background: transparent; padding: 2px 5px; color: var(--muted); font-size: 12px; }
 .text-button:hover:not(:disabled) { border: 0; background: transparent; color: var(--accent); }
 
-.profile-intro { margin-bottom: 20px; }
+.launcher-note { display: grid; gap: 4px; margin-bottom: 20px; border: 1px solid #315c7c; border-radius: 11px; background: #0d2030; padding: 13px 15px; color: #b6cbd7; font-size: 13px; }
+.launcher-note strong { color: #ddecf5; }
 .profile-list { display: grid; gap: 12px; }
 .profile-card {
   display: grid;
@@ -83,6 +85,7 @@ button.primary:hover:not(:disabled) { background: #81ecc6; }
 .chip.warning { color: var(--warning); border-color: #765b2c; background: #332610; }
 .profile-actions { display: flex; gap: 7px; justify-content: flex-end; flex-wrap: wrap; }
 .profile-actions button { padding: 7px 10px; font-size: 12px; }
+.profile-actions .launch-profile { min-width: 82px; }
 .auto-sync-toggle { flex-direction: row; align-items: center; gap: 6px; border: 1px solid #3b554e; border-radius: 9px; background: #182822; padding: 7px 10px; font-size: 12px; font-weight: 500; cursor: pointer; }
 .auto-sync-toggle input { width: auto; accent-color: var(--accent); }
 .profile-recovery { position: relative; font-size: 12px; }

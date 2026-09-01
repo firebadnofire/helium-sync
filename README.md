@@ -1,10 +1,10 @@
 # Helium Sync
 
-Helium Sync provides encrypted multi-device bookmark synchronization for the Helium browser. The desktop client discovers local Helium profiles, reconciles local and server changes, encrypts them locally, and stores only opaque ciphertext on a self-hosted Linux server.
+Helium Sync is an encrypted profile launcher and multi-device synchronizer for the Helium browser. The desktop client creates and launches isolated Helium profiles, reconciles bookmarks, copies installed extensions and extension-owned data, encrypts everything locally, and stores only opaque ciphertext on a self-hosted Linux server.
 
-While the desktop client is open and signed in, enabled profiles are checked every 30 seconds. Independent bookmark additions, edits, and deletions are reconciled against an encrypted local merge base. Any local replacement is backed up with Zstandard compression first. Helium must be closed before server changes can be applied locally; the client detects the installed Helium executable and refuses to race it.
+The first profile is presented as **You**. Add named profiles and launch any one with a click, similar to choosing an instance in MultiMC. Helium must be closed before creating, syncing, restoring, or switching profiles so Chromium cannot rewrite profile databases during the operation.
 
-This is bookmark continuity, not full Chrome/Firefox parity. Open tabs, browsing history, passwords, extensions, preferences, and live in-browser synchronization are not yet synchronized.
+Independent bookmark additions, edits, and deletions are reconciled against an encrypted local merge base. Extension snapshots use conflict detection because their databases cannot be safely three-way merged. Every local replacement is backed up with Zstandard compression first. Open tabs, browsing history, passwords, website storage, and live in-browser synchronization are not synchronized.
 
 > **New operator?** Start with the complete [download, build, deployment, client, backup, upgrade, and troubleshooting guide](op-guide.md).
 
@@ -14,7 +14,7 @@ This is bookmark continuity, not full Chrome/Firefox parity. Open tabs, browsing
 - Authenticated TLS 1.3 HTTPS and SSH-to-Unix-socket transports with the same versioned API.
 - XChaCha20-Poly1305 object encryption using client-held key material.
 - SQLite state, atomic batches, conflict detection, change cursors, and tombstones.
-- Cross-device encrypted profile discovery and three-way bookmark reconciliation.
+- Cross-device encrypted profile discovery, three-way bookmark reconciliation, and chunked extension snapshots.
 - Docker Compose and hardened systemd deployment examples.
 
 ## Start here
@@ -36,7 +36,7 @@ This is bookmark continuity, not full Chrome/Firefox parity. Open tabs, browsing
 | Package | Purpose |
 | --- | --- |
 | `helium-sync-common` | Versioned wire DTOs and validated IDs/timestamps/binary fields |
-| `helium-sync-profile` | Helium discovery, bookmark canonicalization, and ZIP-backed guarded restore |
+| `helium-sync-profile` | Helium discovery, profile allocation, bookmark canonicalization, and Zstandard ZIP-backed guarded restores |
 | `helium-sync-client-core` | Transports, key storage, encryption, state, and workflows |
 | `helium-sync-client` | Thin Tauri 2 adapters and vanilla TypeScript UI |
 | `helium-sync-server` | Linux HTTPS/Unix-socket API and SQLite storage |

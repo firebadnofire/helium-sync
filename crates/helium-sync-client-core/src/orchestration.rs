@@ -1,8 +1,14 @@
 use std::{collections::HashMap, sync::Arc};
 
-use helium_sync_common::{DeviceId, ObjectId, PutObjectRequest, RegisterDeviceRequest, Timestamp};
-use helium_sync_profile::{BookmarkSnapshotV1, DiscoveredProfile, read_bookmarks};
-use serde::Serialize;
+use helium_sync_common::{
+    DeleteObjectRequest, DeviceId, ObjectId, PutObjectRequest, RegisterDeviceRequest, Timestamp,
+};
+use helium_sync_profile::{
+    BookmarkSnapshotV1, DiscoveredProfile, ExtensionBundleDescriptor, ExtensionBundleStats,
+    read_bookmarks,
+};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 
 use crate::{
     ClientError,
@@ -12,6 +18,9 @@ use crate::{
 
 pub const SYNTHETIC_SENTINEL: &str = "HELIUM_SYNC_TRANSPORT_TEST_PLAINTEXT_7f3a9c21";
 pub const BOOKMARK_NAMESPACE: &str = "helium.bookmarks.v1";
+pub const EXTENSION_MANIFEST_NAMESPACE: &str = "helium.extensions.manifest.v1";
+pub const EXTENSION_CHUNK_NAMESPACE: &str = "helium.extensions.chunk.v1";
+pub const EXTENSION_CHUNK_BYTES: usize = 2_900_000;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SyncProof {
@@ -20,6 +29,24 @@ pub struct SyncProof {
     pub revision: u64,
     pub cursor: u64,
     pub plaintext_matches: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExtensionChunkV1 {
+    pub object_id: ObjectId,
+    pub revision: u64,
+    pub sha256: String,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExtensionManifestV1 {
+    pub format: String,
+    pub profile_directory: String,
+    pub archive_sha256: String,
+    pub archive_bytes: u64,
+    pub stats: ExtensionBundleStats,
+    pub chunks: Vec<ExtensionChunkV1>,
 }
 
 pub struct ClientCore {
@@ -73,6 +100,30 @@ impl ClientCore {
         crypto::decrypt_local_state(
             &self.master_key,
             &format!("{BOOKMARK_NAMESPACE}:{profile_directory}"),
+            encrypted,
+        )
+    }
+
+    pub fn protect_extension_sync_base(
+        &self,
+        profile_directory: &str,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, ClientError> {
+        crypto::encrypt_local_state(
+            &self.master_key,
+            &format!("{EXTENSION_MANIFEST_NAMESPACE}:{profile_directory}"),
+            plaintext,
+        )
+    }
+
+    pub fn open_extension_sync_base(
+        &self,
+        profile_directory: &str,
+        encrypted: &[u8],
+    ) -> Result<Vec<u8>, ClientError> {
+        crypto::decrypt_local_state(
+            &self.master_key,
+            &format!("{EXTENSION_MANIFEST_NAMESPACE}:{profile_directory}"),
             encrypted,
         )
     }
@@ -190,6 +241,237 @@ impl ClientCore {
         Ok(None)
     }
 
+    pub async fn save_extension_bundle(
+        &self,
+        descriptor: &ExtensionBundleDescriptor,
+        archive: &[u8],
+        object_id: Option<ObjectId>,
+        base_revision: Option<u64>,
+    ) -> Result<(SyncProof, ExtensionManifestV1), ClientError> {
+        if object_id.is_some() != base_revision.is_some() {
+            return Err(ClientError::State(
+                "extension manifest object ID and revision must either both exist or both be absent"
+                    .to_owned(),
+            ));
+        }
+        let archive_bytes = u64::try_from(archive.len())
+            .map_err(|error| ClientError::Serialization(error.to_string()))?;
+        if descriptor.archive_bytes != archive_bytes
+            || descriptor.archive_sha256 != sha256_bytes(archive)
+        {
+            return Err(ClientError::Serialization(
+                "extension archive does not match its descriptor".to_owned(),
+            ));
+        }
+        let old_manifest = if let Some(id) = object_id {
+            Some(self.load_extension_manifest(id).await?.0)
+        } else {
+            None
+        };
+        let mut uploaded = Vec::new();
+        for chunk in archive.chunks(EXTENSION_CHUNK_BYTES) {
+            match self
+                .upload(EXTENSION_CHUNK_NAMESPACE, chunk, None, None)
+                .await
+            {
+                Ok(proof) => uploaded.push((proof, sha256_bytes(chunk), chunk.len() as u64)),
+                Err(error) => {
+                    let cleanup = self
+                        .delete_objects(
+                            uploaded
+                                .iter()
+                                .map(|value| (value.0.object_id, value.0.revision))
+                                .collect(),
+                        )
+                        .await;
+                    return Err(match cleanup {
+                        Ok(()) => error,
+                        Err(cleanup_error) => ClientError::State(format!(
+                            "extension chunk upload failed ({error}); cleanup also failed ({cleanup_error})"
+                        )),
+                    });
+                }
+            }
+        }
+        let manifest = ExtensionManifestV1 {
+            format: descriptor.format.clone(),
+            profile_directory: descriptor.profile_directory.clone(),
+            archive_sha256: descriptor.archive_sha256.clone(),
+            archive_bytes: descriptor.archive_bytes,
+            stats: descriptor.stats.clone(),
+            chunks: uploaded
+                .iter()
+                .map(|(proof, sha256, bytes)| ExtensionChunkV1 {
+                    object_id: proof.object_id,
+                    revision: proof.revision,
+                    sha256: sha256.clone(),
+                    bytes: *bytes,
+                })
+                .collect(),
+        };
+        let plaintext = serde_json::to_vec(&manifest)
+            .map_err(|error| ClientError::Serialization(error.to_string()))?;
+        let proof = match self
+            .upload(
+                EXTENSION_MANIFEST_NAMESPACE,
+                &plaintext,
+                object_id,
+                base_revision,
+            )
+            .await
+        {
+            Ok(proof) => proof,
+            Err(error) => {
+                let cleanup = self
+                    .delete_objects(
+                        uploaded
+                            .iter()
+                            .map(|value| (value.0.object_id, value.0.revision))
+                            .collect(),
+                    )
+                    .await;
+                return Err(match cleanup {
+                    Ok(()) => error,
+                    Err(cleanup_error) => ClientError::State(format!(
+                        "extension manifest upload failed ({error}); new chunk cleanup also failed ({cleanup_error})"
+                    )),
+                });
+            }
+        };
+        if let Some(old_manifest) = old_manifest {
+            let old_chunks = old_manifest
+                .chunks
+                .iter()
+                .map(|chunk| (chunk.object_id, chunk.revision))
+                .collect();
+            if let Err(error) = self.delete_objects(old_chunks).await {
+                return Err(ClientError::State(format!(
+                    "the new extension snapshot is active, but old chunk cleanup failed: {error}"
+                )));
+            }
+        }
+        Ok((proof, manifest))
+    }
+
+    pub async fn load_extension_bundle(
+        &self,
+        object_id: ObjectId,
+    ) -> Result<(ExtensionManifestV1, Vec<u8>, SyncProof), ClientError> {
+        let (manifest, proof) = self.load_extension_manifest(object_id).await?;
+        let mut archive = Vec::new();
+        for chunk in &manifest.chunks {
+            let (plaintext, chunk_proof) = self
+                .download(EXTENSION_CHUNK_NAMESPACE, chunk.object_id)
+                .await?;
+            if chunk_proof.revision != chunk.revision
+                || plaintext.len() as u64 != chunk.bytes
+                || sha256_bytes(&plaintext) != chunk.sha256
+            {
+                return Err(ClientError::Crypto(format!(
+                    "extension chunk {} failed manifest verification",
+                    chunk.object_id
+                )));
+            }
+            archive.extend_from_slice(&plaintext);
+        }
+        if archive.len() as u64 != manifest.archive_bytes
+            || sha256_bytes(&archive) != manifest.archive_sha256
+        {
+            return Err(ClientError::Crypto(
+                "reassembled extension archive failed manifest verification".to_owned(),
+            ));
+        }
+        Ok((manifest, archive, proof))
+    }
+
+    pub async fn discover_extension_bundle(
+        &self,
+        profile_directory: &str,
+    ) -> Result<Option<(ExtensionManifestV1, SyncProof)>, ClientError> {
+        let mut after = 0;
+        let mut candidates = HashMap::new();
+        loop {
+            let page = self.api.changes(after).await?;
+            for change in page.changes {
+                if change.namespace == EXTENSION_MANIFEST_NAMESPACE {
+                    candidates.insert(change.object_id, (change.cursor, change.deleted));
+                }
+            }
+            if !page.has_more {
+                break;
+            }
+            if page.next_cursor <= after {
+                return Err(ClientError::Serialization(
+                    "server change cursor did not advance".to_owned(),
+                ));
+            }
+            after = page.next_cursor;
+        }
+        let mut candidates = candidates
+            .into_iter()
+            .filter_map(|(id, (cursor, deleted))| (!deleted).then_some((id, cursor)))
+            .collect::<Vec<_>>();
+        candidates.sort_unstable_by_key(|(_, cursor)| std::cmp::Reverse(*cursor));
+        for (object_id, _) in candidates {
+            let (manifest, proof) = self.load_extension_manifest(object_id).await?;
+            if manifest.profile_directory == profile_directory {
+                return Ok(Some((manifest, proof)));
+            }
+        }
+        Ok(None)
+    }
+
+    pub async fn load_extension_manifest(
+        &self,
+        object_id: ObjectId,
+    ) -> Result<(ExtensionManifestV1, SyncProof), ClientError> {
+        let (plaintext, proof) = self
+            .download(EXTENSION_MANIFEST_NAMESPACE, object_id)
+            .await?;
+        let manifest = serde_json::from_slice(&plaintext)
+            .map_err(|error| ClientError::Serialization(error.to_string()))?;
+        Ok((manifest, proof))
+    }
+
+    async fn download(
+        &self,
+        expected_namespace: &str,
+        object_id: ObjectId,
+    ) -> Result<(Vec<u8>, SyncProof), ClientError> {
+        let stored = self.api.get_object(object_id).await?;
+        if stored.namespace != expected_namespace {
+            return Err(ClientError::Serialization(format!(
+                "server object has unexpected namespace {}",
+                stored.namespace
+            )));
+        }
+        let plaintext = crypto::decrypt(&self.master_key, &stored)?;
+        let proof = SyncProof {
+            object_id,
+            namespace: stored.namespace,
+            revision: stored.revision,
+            cursor: stored.cursor,
+            plaintext_matches: true,
+        };
+        Ok((plaintext, proof))
+    }
+
+    async fn delete_objects(&self, objects: Vec<(ObjectId, u64)>) -> Result<(), ClientError> {
+        for (object_id, revision) in objects {
+            self.api
+                .delete_object(
+                    object_id,
+                    &DeleteObjectRequest {
+                        base_revision: revision,
+                        device_id: self.device_id,
+                        modified_at: Timestamp::now_utc(),
+                    },
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
     async fn round_trip(
         &self,
         namespace: &str,
@@ -245,6 +527,10 @@ impl ClientCore {
             plaintext_matches: matches,
         })
     }
+}
+
+fn sha256_bytes(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 #[cfg(test)]
@@ -370,6 +656,75 @@ mod tests {
             .unwrap();
         assert_eq!(second.object_id, first.object_id);
         assert_eq!(second.revision, 2);
+    }
+
+    #[tokio::test]
+    async fn extension_bundle_is_chunked_verified_and_replaces_old_chunks() {
+        let pool = helium_sync_server::storage::memory().await.unwrap();
+        let state = helium_sync_server::api::AppState::new(
+            pool.clone(),
+            &SecretString::from("0123456789abcdef0123456789abcdef".to_owned()),
+        );
+        let transport = Arc::new(RouterTransport {
+            router: helium_sync_server::router(state),
+        });
+        let api = Arc::new(ApiClient::new(
+            transport,
+            SecretString::from("0123456789abcdef0123456789abcdef".to_owned()),
+        ));
+        let core = ClientCore::new(api, MasterKey::generate(), DeviceId::new());
+        core.register_device("extension test").await.unwrap();
+        let archive = vec![0x5a; EXTENSION_CHUNK_BYTES + 137];
+        let descriptor = ExtensionBundleDescriptor {
+            format: "helium-extensions-v1".to_owned(),
+            profile_directory: "Default".to_owned(),
+            archive_sha256: sha256_bytes(&archive),
+            archive_bytes: archive.len() as u64,
+            stats: ExtensionBundleStats {
+                extensions: 2,
+                files: 8,
+                bytes: archive.len() as u64,
+            },
+        };
+
+        let (first_proof, first_manifest) = core
+            .save_extension_bundle(&descriptor, &archive, None, None)
+            .await
+            .unwrap();
+        assert_eq!(first_manifest.chunks.len(), 2);
+        let (loaded_manifest, loaded, loaded_proof) = core
+            .load_extension_bundle(first_proof.object_id)
+            .await
+            .unwrap();
+        assert_eq!(loaded, archive);
+        assert_eq!(loaded_manifest, first_manifest);
+        assert_eq!(loaded_proof.revision, 1);
+
+        let replacement = vec![0x33; 1024];
+        let replacement_descriptor = ExtensionBundleDescriptor {
+            archive_sha256: sha256_bytes(&replacement),
+            archive_bytes: replacement.len() as u64,
+            ..descriptor
+        };
+        let (second_proof, second_manifest) = core
+            .save_extension_bundle(
+                &replacement_descriptor,
+                &replacement,
+                Some(first_proof.object_id),
+                Some(first_proof.revision),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second_proof.object_id, first_proof.object_id);
+        assert_eq!(second_proof.revision, 2);
+        assert_eq!(second_manifest.chunks.len(), 1);
+        let active_chunks: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM objects WHERE namespace = ? AND deleted = 0")
+                .bind(EXTENSION_CHUNK_NAMESPACE)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(active_chunks, 1);
     }
 
     #[tokio::test]

@@ -1,18 +1,22 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{path::PathBuf, process::Command, sync::Arc};
 
 use directories::{ProjectDirs, UserDirs};
 use helium_sync_client_core::{
     api::ApiClient,
     crypto::MasterKey,
     https::{CertificateMode, HttpsTransport, spki_sha256_from_pem},
-    orchestration::{BOOKMARK_NAMESPACE, ClientCore},
+    orchestration::{
+        BOOKMARK_NAMESPACE, ClientCore, EXTENSION_MANIFEST_NAMESPACE, ExtensionManifestV1,
+        SyncProof,
+    },
     secrets::{NativeSecretStore, SecretStore as _},
     ssh::{SshConfig, SshTransport},
     state::LocalState,
 };
 use helium_sync_profile::{
-    BookmarkStats, BookmarkStatus, DiscoveredProfile, DiscoveryOptions, bookmark_stats,
-    merge_bookmarks, read_bookmarks, restore_bookmarks,
+    BookmarkStats, BookmarkStatus, DiscoveredProfile, DiscoveryOptions, ExtensionBundleDescriptor,
+    ExtensionBundleStats, bookmark_stats, create_extension_bundle, create_profile, merge_bookmarks,
+    read_bookmarks, restore_bookmarks, restore_extension_bundle,
 };
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::{Deserialize, Serialize};
@@ -104,6 +108,22 @@ struct SyncFeedback {
     revision: u64,
     conflicts: u64,
     backup_path: Option<PathBuf>,
+    extension_stats: Option<ExtensionBundleStats>,
+    extension_backup_path: Option<PathBuf>,
+    message: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LaunchResult {
+    profile_name: String,
+    sync: Option<SyncFeedback>,
+    message: String,
+}
+
+struct ExtensionSyncOutcome {
+    stats: ExtensionBundleStats,
+    backup_path: Option<PathBuf>,
     message: String,
 }
 
@@ -118,6 +138,68 @@ struct LoginResult {
 async fn discover_profiles(state: State<'_, UiState>) -> Result<ProfileReport, String> {
     let local = local_state(&state).await?;
     profile_report(&state, &local).await
+}
+
+#[tauri::command]
+async fn create_browser_profile(
+    display_name: String,
+    state: State<'_, UiState>,
+) -> Result<ProfileReport, String> {
+    let display_name = display_name.trim();
+    if display_name.is_empty() || display_name.chars().count() > 128 {
+        return Err("Profile name must contain 1 to 128 characters".to_owned());
+    }
+    ensure_helium_closed()?;
+    let installation =
+        helium_sync_profile::discover_installation(&DiscoveryOptions::from_environment())
+            .map_err(|error| error.to_string())?;
+    let profile = create_profile(&installation.user_data_dir).map_err(|error| error.to_string())?;
+    let local = local_state(&state).await?;
+    local
+        .ensure_profile(&profile.directory_name, display_name)
+        .await
+        .map_err(|error| error.to_string())?;
+    profile_report(&state, &local).await
+}
+
+#[tauri::command]
+async fn launch_profile(
+    profile_directory: String,
+    state: State<'_, UiState>,
+) -> Result<LaunchResult, String> {
+    let profile = discovered_profile(&profile_directory)?;
+    ensure_helium_closed()?;
+    let sync = if state.session.lock().await.is_some()
+        && profile.bookmark_status == BookmarkStatus::Readable
+    {
+        let (core, local, server_id) = session_context(&state).await?;
+        Some(
+            sync_profile_with_server(&core, &local, &server_id, &profile, &downloads_dir()?)
+                .await?,
+        )
+    } else {
+        None
+    };
+    let installation =
+        helium_sync_profile::discover_installation(&DiscoveryOptions::from_environment())
+            .map_err(|error| error.to_string())?;
+    let executable = installation
+        .executable
+        .filter(|path| path.is_file())
+        .ok_or_else(|| {
+            "Helium executable was not found. Set HELIUM_SYNC_HELIUM_PATH to the executable."
+                .to_owned()
+        })?;
+    Command::new(&executable)
+        .arg(format!("--profile-directory={}", profile.directory_name))
+        .spawn()
+        .map_err(|error| format!("Could not launch {}: {error}", executable.display()))?;
+    let name = profile_name(&local_state(&state).await?, &profile).await?;
+    Ok(LaunchResult {
+        profile_name: name.clone(),
+        sync,
+        message: format!("Launched {name}. Close Helium before switching profiles."),
+    })
 }
 
 #[tauri::command]
@@ -338,6 +420,7 @@ async fn save_profile(
     profile_directory: String,
     state: State<'_, UiState>,
 ) -> Result<SyncFeedback, String> {
+    ensure_helium_closed()?;
     let profile = discovered_profile(&profile_directory)?;
     let (core, local, server_id) = session_context(&state).await?;
     save_profile_to_server(&core, &local, &server_id, &profile).await
@@ -348,6 +431,7 @@ async fn load_profile(
     profile_directory: String,
     state: State<'_, UiState>,
 ) -> Result<SyncFeedback, String> {
+    ensure_helium_closed()?;
     let profile = discovered_profile(&profile_directory)?;
     let (core, local, server_id) = session_context(&state).await?;
     load_profile_from_server(&core, &local, &server_id, &profile).await
@@ -358,6 +442,7 @@ async fn sync_profile(
     profile_directory: String,
     state: State<'_, UiState>,
 ) -> Result<SyncFeedback, String> {
+    ensure_helium_closed()?;
     let profile = discovered_profile(&profile_directory)?;
     let (core, local, server_id) = session_context(&state).await?;
     sync_profile_with_server(&core, &local, &server_id, &profile, &downloads_dir()?).await
@@ -398,8 +483,13 @@ async fn ensure_discovered_profiles(local: &LocalState) -> Result<Vec<Discovered
     let report = helium_sync_profile::discover(&DiscoveryOptions::from_environment())
         .map_err(|error| error.to_string())?;
     for profile in &report.profiles {
+        let initial_name = if profile.directory_name == "Default" {
+            "You"
+        } else {
+            &profile.display_name
+        };
         local
-            .ensure_profile(&profile.directory_name, &profile.display_name)
+            .ensure_profile(&profile.directory_name, initial_name)
             .await
             .map_err(|error| error.to_string())?;
     }
@@ -519,12 +609,211 @@ async fn profile_name(local: &LocalState, profile: &DiscoveredProfile) -> Result
         .map_or_else(|| profile.display_name.clone(), |value| value.display_name))
 }
 
+fn capture_extensions(
+    profile: &DiscoveredProfile,
+) -> Result<(ExtensionBundleDescriptor, Vec<u8>), String> {
+    let staging = tempfile::tempdir().map_err(|error| format!("Extension staging: {error}"))?;
+    let archive_path = staging.path().join("extensions.zip");
+    let descriptor =
+        create_extension_bundle(profile, &archive_path).map_err(|error| error.to_string())?;
+    let archive = std::fs::read(&archive_path)
+        .map_err(|error| format!("Could not read staged extension archive: {error}"))?;
+    Ok((descriptor, archive))
+}
+
+async fn persist_extension_sync_state(
+    core: &ClientCore,
+    local: &LocalState,
+    server_id: &str,
+    profile: &DiscoveredProfile,
+    manifest: &ExtensionManifestV1,
+    proof: &SyncProof,
+) -> Result<(), String> {
+    let encrypted = core
+        .protect_extension_sync_base(&profile.directory_name, manifest.archive_sha256.as_bytes())
+        .map_err(|error| format!("Extension sync state: {error}"))?;
+    local
+        .save_sync_state(
+            server_id,
+            EXTENSION_MANIFEST_NAMESPACE,
+            &profile.directory_name,
+            proof.object_id,
+            proof.revision,
+            &encrypted,
+        )
+        .await
+        .map_err(|error| error.to_string())
+}
+
+async fn extension_base_hash(
+    core: &ClientCore,
+    local: &LocalState,
+    server_id: &str,
+    profile: &DiscoveredProfile,
+) -> Result<Option<String>, String> {
+    local
+        .sync_base(
+            server_id,
+            EXTENSION_MANIFEST_NAMESPACE,
+            &profile.directory_name,
+        )
+        .await
+        .map_err(|error| error.to_string())?
+        .map(|encrypted| {
+            let plaintext = core
+                .open_extension_sync_base(&profile.directory_name, &encrypted)
+                .map_err(|error| format!("Stored extension sync base: {error}"))?;
+            String::from_utf8(plaintext)
+                .map_err(|error| format!("Stored extension sync base is invalid: {error}"))
+        })
+        .transpose()
+}
+
+async fn remote_extension_manifest(
+    core: &ClientCore,
+    local: &LocalState,
+    server_id: &str,
+    profile: &DiscoveredProfile,
+) -> Result<Option<(ExtensionManifestV1, SyncProof)>, String> {
+    let mapping = local
+        .mapping(
+            server_id,
+            EXTENSION_MANIFEST_NAMESPACE,
+            &profile.directory_name,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    match mapping {
+        Some(mapping) => core
+            .load_extension_manifest(mapping.object_id)
+            .await
+            .map(Some)
+            .map_err(|error| error.to_string()),
+        None => core
+            .discover_extension_bundle(&profile.directory_name)
+            .await
+            .map_err(|error| error.to_string()),
+    }
+}
+
+async fn save_extensions_to_server(
+    core: &ClientCore,
+    local: &LocalState,
+    server_id: &str,
+    profile: &DiscoveredProfile,
+) -> Result<ExtensionSyncOutcome, String> {
+    let (descriptor, archive) = capture_extensions(profile)?;
+    let remote = remote_extension_manifest(core, local, server_id, profile).await?;
+    let (proof, manifest) = core
+        .save_extension_bundle(
+            &descriptor,
+            &archive,
+            remote.as_ref().map(|value| value.1.object_id),
+            remote.as_ref().map(|value| value.1.revision),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    persist_extension_sync_state(core, local, server_id, profile, &manifest, &proof).await?;
+    Ok(ExtensionSyncOutcome {
+        stats: manifest.stats,
+        backup_path: None,
+        message: "Uploaded installed extensions and extension data.".to_owned(),
+    })
+}
+
+async fn load_extensions_from_server(
+    core: &ClientCore,
+    local: &LocalState,
+    server_id: &str,
+    profile: &DiscoveredProfile,
+    backup_dir: &std::path::Path,
+) -> Result<ExtensionSyncOutcome, String> {
+    let (_, manifest_proof) = remote_extension_manifest(core, local, server_id, profile)
+        .await?
+        .ok_or_else(|| "This profile has no saved extension copy.".to_owned())?;
+    let (manifest, archive, proof) = core
+        .load_extension_bundle(manifest_proof.object_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let staging = tempfile::tempdir().map_err(|error| format!("Extension staging: {error}"))?;
+    let archive_path = staging.path().join("extensions.zip");
+    std::fs::write(&archive_path, archive)
+        .map_err(|error| format!("Could not stage downloaded extension archive: {error}"))?;
+    let restored = restore_extension_bundle(profile, &archive_path, backup_dir)
+        .map_err(|error| error.to_string())?;
+    persist_extension_sync_state(core, local, server_id, profile, &manifest, &proof).await?;
+    Ok(ExtensionSyncOutcome {
+        stats: restored.stats,
+        backup_path: Some(restored.backup_path),
+        message: "Restored installed extensions and extension data after backup.".to_owned(),
+    })
+}
+
+async fn sync_extensions_with_server(
+    core: &ClientCore,
+    local: &LocalState,
+    server_id: &str,
+    profile: &DiscoveredProfile,
+    backup_dir: &std::path::Path,
+) -> Result<ExtensionSyncOutcome, String> {
+    let (descriptor, archive) = capture_extensions(profile)?;
+    let Some((remote, proof)) = remote_extension_manifest(core, local, server_id, profile).await?
+    else {
+        let (proof, manifest) = core
+            .save_extension_bundle(&descriptor, &archive, None, None)
+            .await
+            .map_err(|error| error.to_string())?;
+        persist_extension_sync_state(core, local, server_id, profile, &manifest, &proof).await?;
+        return Ok(ExtensionSyncOutcome {
+            stats: manifest.stats,
+            backup_path: None,
+            message: "Started encrypted extension sync.".to_owned(),
+        });
+    };
+    let base = extension_base_hash(core, local, server_id, profile).await?;
+    if base.is_none() && descriptor.archive_sha256 == remote.archive_sha256 {
+        persist_extension_sync_state(core, local, server_id, profile, &remote, &proof).await?;
+        return Ok(ExtensionSyncOutcome {
+            stats: remote.stats,
+            backup_path: None,
+            message: "Extensions are already up to date.".to_owned(),
+        });
+    }
+    let local_changed = base
+        .as_ref()
+        .is_none_or(|hash| hash != &descriptor.archive_sha256);
+    let remote_changed = base
+        .as_ref()
+        .is_none_or(|hash| hash != &remote.archive_sha256);
+    match (base.is_some(), local_changed, remote_changed) {
+        (_, false, false) | (false, _, false) => {
+            persist_extension_sync_state(core, local, server_id, profile, &remote, &proof).await?;
+            Ok(ExtensionSyncOutcome {
+                stats: remote.stats,
+                backup_path: None,
+                message: "Extensions are already up to date.".to_owned(),
+            })
+        }
+        (false, _, true) | (true, false, true) => {
+            load_extensions_from_server(core, local, server_id, profile, backup_dir).await
+        }
+        (true, true, false) => save_extensions_to_server(core, local, server_id, profile).await,
+        (true, true, true) => Err(
+            "Extensions changed both locally and on the server. Use Recovery to explicitly replace the server copy or restore the server copy."
+                .to_owned(),
+        ),
+    }
+}
+
 async fn save_profile_to_server(
     core: &ClientCore,
     local: &LocalState,
     server_id: &str,
     profile: &DiscoveredProfile,
 ) -> Result<SyncFeedback, String> {
+    let extensions = save_extensions_to_server(core, local, server_id, profile)
+        .await
+        .map_err(|error| format!("Extension save failed before bookmarks were changed: {error}"))?;
     let mapping = local
         .mapping(server_id, BOOKMARK_NAMESPACE, &profile.directory_name)
         .await
@@ -544,13 +833,15 @@ async fn save_profile_to_server(
         profile_directory: profile.directory_name.clone(),
         profile_name: profile_name(local, profile).await?,
         message: format!(
-            "Saved {} bookmarks in {} folders.",
-            stats.bookmarks, stats.folders
+            "Saved {} bookmarks in {} folders. {}",
+            stats.bookmarks, stats.folders, extensions.message
         ),
         stats,
         revision: proof.revision,
         conflicts: 0,
         backup_path: None,
+        extension_stats: Some(extensions.stats),
+        extension_backup_path: extensions.backup_path,
     })
 }
 
@@ -560,6 +851,12 @@ async fn load_profile_from_server(
     server_id: &str,
     profile: &DiscoveredProfile,
 ) -> Result<SyncFeedback, String> {
+    let downloads = downloads_dir()?;
+    let extensions = load_extensions_from_server(core, local, server_id, profile, &downloads)
+        .await
+        .map_err(|error| {
+            format!("Extension restore failed before bookmarks were changed: {error}")
+        })?;
     let mapping = local
         .mapping(server_id, BOOKMARK_NAMESPACE, &profile.directory_name)
         .await
@@ -571,8 +868,6 @@ async fn load_profile_from_server(
         .load_bookmarks(mapping.object_id)
         .await
         .map_err(|error| error.to_string())?;
-    ensure_helium_closed(profile)?;
-    let downloads = downloads_dir()?;
     let restored =
         restore_bookmarks(profile, &snapshot, &downloads).map_err(|error| error.to_string())?;
     persist_sync_state(core, local, server_id, profile, &snapshot, &proof).await?;
@@ -581,13 +876,15 @@ async fn load_profile_from_server(
         profile_directory: profile.directory_name.clone(),
         profile_name: profile_name(local, profile).await?,
         message: format!(
-            "Loaded {} bookmarks. The previous local file is backed up in Downloads.",
+            "Loaded {} bookmarks. Previous bookmarks and extension data are backed up in Downloads.",
             restored.stats.bookmarks
         ),
         stats: restored.stats,
         revision: proof.revision,
         conflicts: 0,
         backup_path: Some(restored.backup_path),
+        extension_stats: Some(extensions.stats),
+        extension_backup_path: extensions.backup_path,
     })
 }
 
@@ -598,6 +895,9 @@ async fn sync_profile_with_server(
     profile: &DiscoveredProfile,
     backup_dir: &std::path::Path,
 ) -> Result<SyncFeedback, String> {
+    let extensions = sync_extensions_with_server(core, local, server_id, profile, backup_dir)
+        .await
+        .map_err(|error| format!("Extension sync stopped before bookmark sync: {error}"))?;
     let local_snapshot = read_bookmarks(&profile.bookmarks_path, &profile.directory_name)
         .map_err(|error| error.to_string())?;
     let mapping = local
@@ -628,13 +928,15 @@ async fn sync_profile_with_server(
             profile_directory: profile.directory_name.clone(),
             profile_name: profile_name(local, profile).await?,
             message: format!(
-                "Started encrypted sync with {} bookmarks in {} folders.",
-                stats.bookmarks, stats.folders
+                "Started encrypted sync with {} bookmarks in {} folders. {}",
+                stats.bookmarks, stats.folders, extensions.message
             ),
             stats,
             revision: proof.revision,
             conflicts: 0,
             backup_path: None,
+            extension_stats: Some(extensions.stats),
+            extension_backup_path: extensions.backup_path,
         });
     };
 
@@ -654,10 +956,6 @@ async fn sync_profile_with_server(
         .map_err(|error| error.to_string())?;
     let remote_changed = merged.snapshot != remote_snapshot;
     let local_changed = merged.snapshot != local_snapshot;
-
-    if local_changed {
-        ensure_helium_closed(profile)?;
-    }
 
     if remote_changed {
         proof = core
@@ -697,7 +995,9 @@ async fn sync_profile_with_server(
         revision: proof.revision,
         conflicts: merged.conflicts,
         backup_path,
-        message,
+        message: format!("{message} {}", extensions.message),
+        extension_stats: Some(extensions.stats),
+        extension_backup_path: extensions.backup_path,
     })
 }
 
@@ -736,43 +1036,59 @@ fn downloads_dir() -> Result<PathBuf, String> {
         .unwrap_or_else(|| user_dirs.home_dir().join("Downloads")))
 }
 
-fn ensure_helium_closed(profile: &DiscoveredProfile) -> Result<(), String> {
+fn ensure_helium_closed() -> Result<(), String> {
     let installation =
         helium_sync_profile::discover_installation(&DiscoveryOptions::from_environment())
             .map_err(|error| error.to_string())?;
-    let Some(expected_executable) = installation.executable else {
-        return Ok(());
-    };
-    let user_data_dir = installation
-        .user_data_dir
-        .canonicalize()
-        .unwrap_or(installation.user_data_dir);
-    let profile_path = profile
-        .path
-        .canonicalize()
-        .unwrap_or_else(|_| profile.path.clone());
-    if !profile_path.starts_with(&user_data_dir) {
-        return Ok(());
-    }
-    let expected = expected_executable
-        .canonicalize()
-        .unwrap_or(expected_executable);
+    ensure_profile_directory_unlocked(&installation.user_data_dir)?;
+    let expected = installation
+        .executable
+        .map(|path| path.canonicalize().unwrap_or(path));
     let system = System::new_all();
     let running = system.processes().values().any(|process| {
-        process
-            .exe()
-            .and_then(|path| {
-                path.canonicalize()
-                    .ok()
-                    .or_else(|| Some(path.to_path_buf()))
-            })
-            .is_some_and(|path| paths_equal(&path, &expected))
+        let executable_matches = expected.as_ref().is_some_and(|expected| {
+            process
+                .exe()
+                .and_then(|path| {
+                    path.canonicalize()
+                        .ok()
+                        .or_else(|| Some(path.to_path_buf()))
+                })
+                .is_some_and(|path| paths_equal(&path, expected))
+        });
+        let name = process.name().to_string_lossy();
+        executable_matches
+            || name.eq_ignore_ascii_case("helium")
+            || name.eq_ignore_ascii_case("helium.exe")
+            || name.eq_ignore_ascii_case("helium-browser")
     });
     if running {
-        return Err(format!(
-            "Close Helium before applying server changes to {}. Local changes can still upload while Helium is open.",
-            profile.display_name
-        ));
+        return Err(
+            "Close every Helium window before creating, syncing, or switching profiles.".to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn ensure_profile_directory_unlocked(user_data_dir: &std::path::Path) -> Result<(), String> {
+    for name in ["SingletonLock", "SingletonSocket", "SingletonCookie"] {
+        let marker = user_data_dir.join(name);
+        let exists = match std::fs::symlink_metadata(&marker) {
+            Ok(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => {
+                return Err(format!(
+                    "Could not inspect Helium's browser lock {}: {error}",
+                    marker.display()
+                ));
+            }
+        };
+        if exists {
+            return Err(format!(
+                "Helium's browser lock {} is active. Close every Helium window before creating, syncing, or switching profiles. If Helium crashed, reopen it and close it normally before retrying.",
+                marker.display()
+            ));
+        }
     }
     Ok(())
 }
@@ -809,6 +1125,7 @@ async fn forced_default_sync(
         return Ok(None);
     };
     if profile.bookmark_status == BookmarkStatus::Readable {
+        ensure_helium_closed()?;
         sync_profile_with_server(core, local, server_id, profile, &downloads_dir()?)
             .await
             .map(Some)
@@ -858,6 +1175,8 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             discover_profiles,
+            create_browser_profile,
+            launch_profile,
             inspect_certificate,
             connect_https,
             connect_ssh,
@@ -887,6 +1206,19 @@ mod tests {
 
     struct RouterTransport {
         router: axum::Router,
+    }
+
+    #[test]
+    fn browser_singleton_marker_blocks_profile_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(ensure_profile_directory_unlocked(temp.path()).is_ok());
+
+        let marker = temp.path().join("SingletonLock");
+        std::fs::write(&marker, "active").unwrap();
+        let error = ensure_profile_directory_unlocked(temp.path()).unwrap_err();
+
+        assert!(error.contains("SingletonLock"));
+        assert!(error.contains("Close every Helium window"));
     }
 
     #[async_trait]

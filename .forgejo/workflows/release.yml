@@ -16,12 +16,19 @@ env:
   RELEASE_BODY: |
     Automated release assets for Helium Sync.
 
+    Highlights:
+    - MultiMC-style creation and one-click launching of isolated Helium profiles.
+    - End-to-end encrypted synchronization of bookmarks, installed extensions,
+      and extension-owned data.
+    - Zstandard backups, chunk verification, and explicit extension conflict
+      handling while Helium is closed.
+
     Assets:
-    - Linux x86_64 server tarball: `helium-sync-server-linux-x86_64.tar.gz`
-    - Linux x86_64 client tarball: `helium-sync-client-linux-x86_64.tar.gz`
-    - Windows x86_64 portable client: `helium-sync-client-windows-x86_64-portable.zip`
+    - Linux x86_64 server tarball: `helium-sync-server-linux-x86_64.tar.zst`
+    - Linux x86_64 client tarball: `helium-sync-client-linux-x86_64.tar.zst`
+    - Windows x86_64 portable client: `helium-sync-client-windows-x86_64-portable.tar.zst`
     - Windows x86_64 NSIS installer: `helium-sync-client-windows-x86_64-installer.exe`
-    - macOS universal client tarball: `helium-sync-client-macos-universal.tar.gz`
+    - macOS universal client tarball: `helium-sync-client-macos-universal.tar.zst`
 
     `SHA256SUMS` contains a basename-only SHA-256 checksum for every listed
     artifact. The checksum manifest and every artifact have armored detached
@@ -94,6 +101,29 @@ jobs:
           fi
 
           version="${tag:1}"
+          if [[ ! "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
+            echo "Release tag version is not valid SemVer: '$version'." >&2
+            exit 1
+          fi
+
+          workspace_version="$(awk '
+            $0 == "[workspace.package]" { in_workspace = 1; next }
+            /^\[/ && in_workspace { exit }
+            in_workspace && $1 == "version" { gsub(/"/, "", $3); print $3; exit }
+          ' Cargo.toml)"
+          package_version="$(sed -n 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' crates/helium-sync-client/package.json | head -n 1)"
+          tauri_version="$(sed -n 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' crates/helium-sync-client/src-tauri/tauri.conf.json | head -n 1)"
+          for entry in \
+            "Cargo workspace:$workspace_version" \
+            "npm client:$package_version" \
+            "Tauri client:$tauri_version"; do
+            name="${entry%%:*}"
+            declared="${entry#*:}"
+            if [[ -z "$declared" || "$declared" != "$version" ]]; then
+              echo "$name version '${declared:-<missing>}' does not match release tag '$tag'." >&2
+              exit 1
+            fi
+          done
           printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
 
   build-linux:
@@ -145,7 +175,8 @@ jobs:
               libxdo-dev \
               pkg-config \
               tar \
-              xz-utils
+              xz-utils \
+              zstd
           else
             apt-get update
             DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
@@ -160,7 +191,8 @@ jobs:
               libxdo-dev \
               pkg-config \
               tar \
-              xz-utils
+              xz-utils \
+              zstd
           fi
 
       - name: Install pinned Rust and Node toolchains
@@ -218,12 +250,12 @@ jobs:
           install -m 0755 target/x86_64-unknown-linux-gnu/release/helium-sync-client "$client_dir/helium-sync-client"
           install -m 0644 LICENSE README.md op-guide.md "$client_dir/"
 
-          tar -C "$package_root" -czf dist/releases/helium-sync-server-linux-x86_64.tar.gz \
-            helium-sync-server-linux-x86_64
-          tar -C "$package_root" -czf dist/releases/helium-sync-client-linux-x86_64.tar.gz \
-            helium-sync-client-linux-x86_64
-          test -s dist/releases/helium-sync-server-linux-x86_64.tar.gz
-          test -s dist/releases/helium-sync-client-linux-x86_64.tar.gz
+          tar -C "$package_root" -cf - helium-sync-server-linux-x86_64 \
+            | zstd -19 -T0 -o dist/releases/helium-sync-server-linux-x86_64.tar.zst
+          tar -C "$package_root" -cf - helium-sync-client-linux-x86_64 \
+            | zstd -19 -T0 -o dist/releases/helium-sync-client-linux-x86_64.tar.zst
+          test -s dist/releases/helium-sync-server-linux-x86_64.tar.zst
+          test -s dist/releases/helium-sync-client-linux-x86_64.tar.zst
 
       - name: Upload Linux release candidates
         uses: https://code.forgejo.org/forgejo/upload-artifact@v4
@@ -271,11 +303,11 @@ jobs:
           if command -v sudo >/dev/null 2>&1; then
             sudo apt-get update
             sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-              ca-certificates curl xz-utils zip
+              ca-certificates curl xz-utils zstd
           else
             apt-get update
             DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-              ca-certificates curl xz-utils zip
+              ca-certificates curl xz-utils zstd
           fi
 
       - name: Install pinned Rust and Node toolchains
@@ -332,8 +364,8 @@ jobs:
           install -m 0755 target/x86_64-pc-windows-msvc/release/helium-sync-client.exe \
             "$portable_dir/helium-sync-client.exe"
           install -m 0644 LICENSE README.md op-guide.md "$portable_dir/"
-          (cd "$package_root"; zip -9 -r "$GITHUB_WORKSPACE/dist/releases/helium-sync-client-windows-x86_64-portable.zip" \
-            helium-sync-client-windows-x86_64-portable)
+          tar -C "$package_root" -cf - helium-sync-client-windows-x86_64-portable \
+            | zstd -19 -T0 -o dist/releases/helium-sync-client-windows-x86_64-portable.tar.zst
 
           shopt -s nullglob
           installers=("$installer_dir"/*-setup.exe)
@@ -346,7 +378,7 @@ jobs:
           install -m 0755 "${installers[0]}" \
             dist/releases/helium-sync-client-windows-x86_64-installer.exe
 
-          test -s dist/releases/helium-sync-client-windows-x86_64-portable.zip
+          test -s dist/releases/helium-sync-client-windows-x86_64-portable.tar.zst
           test -s dist/releases/helium-sync-client-windows-x86_64-installer.exe
 
       - name: Upload Windows release candidate
@@ -413,6 +445,10 @@ jobs:
           tar -xzf "$RUNNER_TEMP/$node_archive" --strip-components=1 -C "$tool_root"
           printf '%s\n' "$tool_root/bin" >> "$GITHUB_PATH"
 
+          if ! command -v zstd >/dev/null 2>&1; then
+            brew install zstd
+          fi
+
       - name: Restore macOS build cache
         uses: https://data.forgejo.org/actions/cache@v4
         continue-on-error: true
@@ -441,9 +477,9 @@ jobs:
           install -m 0755 target/universal-apple-darwin/release/helium-sync-client \
             "$client_dir/helium-sync-client"
           install -m 0644 LICENSE README.md op-guide.md "$client_dir/"
-          tar -C "$package_root" -czf dist/releases/helium-sync-client-macos-universal.tar.gz \
-            helium-sync-client-macos-universal
-          test -s dist/releases/helium-sync-client-macos-universal.tar.gz
+          tar -C "$package_root" -cf - helium-sync-client-macos-universal \
+            | zstd -19 -T0 -o dist/releases/helium-sync-client-macos-universal.tar.zst
+          test -s dist/releases/helium-sync-client-macos-universal.tar.zst
 
       - name: Upload macOS release candidate
         uses: https://code.forgejo.org/forgejo/upload-artifact@v4
@@ -536,11 +572,11 @@ jobs:
           fi
 
           artifacts=(
-            staging/helium-sync-server-linux-x86_64.tar.gz
-            staging/helium-sync-client-linux-x86_64.tar.gz
-            staging/helium-sync-client-windows-x86_64-portable.zip
+            staging/helium-sync-server-linux-x86_64.tar.zst
+            staging/helium-sync-client-linux-x86_64.tar.zst
+            staging/helium-sync-client-windows-x86_64-portable.tar.zst
             staging/helium-sync-client-windows-x86_64-installer.exe
-            staging/helium-sync-client-macos-universal.tar.gz
+            staging/helium-sync-client-macos-universal.tar.zst
           )
           for artifact in "${artifacts[@]}"; do
             if [[ ! -s "$artifact" ]]; then
